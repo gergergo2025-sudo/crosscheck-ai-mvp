@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import math
 import re
 import time
@@ -116,6 +117,13 @@ _SAFE_PROVIDER_STATUSES = {
 def _safe_provider_status(value: object, *, default: str = "error") -> str:
     status = str(value or default).strip().casefold()
     return status if status in _SAFE_PROVIDER_STATUSES else default
+
+
+def _safe_provider_name(value: object, fallback: str = "unknown") -> str:
+    candidate = str(value or "").strip()
+    if not candidate or len(candidate) > 100 or not re.fullmatch(r"[A-Za-z0-9._:-]+", candidate):
+        return fallback
+    return candidate
 
 
 def _safe_http_url(value: object) -> str | None:
@@ -546,6 +554,19 @@ class QueryService:
                 "constraints are too long",
                 details={"constraints": ["maximum length exceeded"]},
             )
+        if isinstance(request.constraints, dict):
+            try:
+                constraints_size = len(json.dumps(request.constraints, ensure_ascii=False, default=str))
+            except (TypeError, ValueError, RecursionError):
+                raise RequestValidationError(
+                    "constraints are invalid",
+                    details={"constraints": ["could not normalize constraints"]},
+                ) from None
+            if constraints_size > self.settings.max_constraints_length:
+                raise RequestValidationError(
+                    "constraints are too long",
+                    details={"constraints": ["maximum length exceeded"]},
+                )
         selected_models = self._selected_models(request)
         deadline = self.clock() + self.settings.query_deadline_seconds
         classification = await resolve_classification(
@@ -575,7 +596,10 @@ class QueryService:
             if failure is not None or adapter_result is None:
                 assert failure is not None
                 failures.append((model, failure))
-                provider = str(getattr(failure, "provider", None) or self._provider_name(model))[:100]
+                provider = _safe_provider_name(
+                    getattr(failure, "provider", None),
+                    _safe_provider_name(self._provider_name(model)),
+                )
                 failure_class = _safe_failure_class(failure)
                 status = "skipped_cost_ceiling" if failure_class == "cost_ceiling" else (
                     "timeout" if failure_class in {"deadline", "timeout"} else "unavailable"
@@ -600,7 +624,10 @@ class QueryService:
 
             reported_cost += float(adapter_result.reported_cost or 0.0)
             raw_text = _bounded_text(adapter_result.raw_text, self.settings.max_raw_response_chars)
-            provider = str(adapter_result.provider or self._provider_name(model))[:100]
+            provider = _safe_provider_name(
+                adapter_result.provider,
+                _safe_provider_name(self._provider_name(model)),
+            )
             provider_status = _safe_provider_status(adapter_result.status)
             # A result status that explicitly denotes failure is not allowed to
             # become a successful parsed answer merely because a provider returned

@@ -6,7 +6,9 @@ function safeHttpUrl(value) {
   if (!value || typeof value !== "string") return null;
   try {
     const url = new URL(value);
-    return url.protocol === "http:" || url.protocol === "https:" ? url : null;
+    if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+    if (!url.hostname || url.username || url.password || /[\u0000-\u001f\u007f]/.test(value)) return null;
+    return url;
   } catch {
     return null;
   }
@@ -49,7 +51,16 @@ function ModelCard({ answer, defaultOpen = false }) {
         <span className="model-meta"><ParseBadge status={answer.parse_status} /> · score {Number(answer.score || 0).toFixed(2)}</span>
       </summary>
       <div className="model-card-body">
-        {answer.failure_class ? <p className="notice warning provider-failure">Provider status: {answer.failure_class}</p> : null}
+        {answer.provider_status && answer.provider_status !== "ok" ? (
+          <p className="provider-status" role="status" aria-label={`Provider status for ${answer.model}`}>
+            Provider status: <strong>{answer.provider_status}</strong>
+            {answer.retry_count ? ` · ${answer.retry_count} retr${answer.retry_count === 1 ? "y" : "ies"}` : null}
+            {answer.failure_class ? ` · ${answer.failure_class}` : null}
+          </p>
+        ) : null}
+        {answer.failure_class && (!answer.provider_status || answer.provider_status === "ok") ? (
+          <p className="notice warning provider-failure">Provider status: {answer.failure_class}</p>
+        ) : null}
         <p>{answer.answer}</p>
         {answer.reasoning ? <p className="rationale"><strong>Rationale:</strong> {answer.reasoning}</p> : null}
         {answer.claims?.length ? (
@@ -175,7 +186,7 @@ export default function App() {
   }
 
   return (
-    <main className="app-shell">
+    <main className="app-shell" aria-busy={loading}>
       <header className="hero">
         <p className="eyebrow">CrossCheck AI</p>
         <h1>Ask once. Inspect the evidence.</h1>
@@ -215,7 +226,7 @@ export default function App() {
         <button className="submit-button" type="submit" disabled={loading || !question.trim()}>
           {loading ? "Checking…" : "Cross-check answer"}
         </button>
-        <p className="status-line" aria-live="polite">{stage}</p>
+        <p className="status-line" role="status" aria-live="polite">{stage}</p>
         {error ? <p className="notice error" role="alert">{error}</p> : null}
       </form>
 

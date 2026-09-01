@@ -136,6 +136,23 @@ async def test_http_partial_report_and_all_failures_are_not_durable(tmp_path: Pa
         assert response.status_code == 502
         assert response.json()["error"]["code"] == "NO_USABLE_MODEL_ANSWER"
 
+    # A missing adapter in the server's default set is an isolated unavailable
+    # sibling, while an explicitly unknown request model remains a 422 boundary
+    # error.
+    settings_mixed = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'mixed.db'}",
+        crosscheck_models="good,missing",
+        adapter_max_retries=0,
+    )
+    app = create_app(settings=settings_mixed, adapters=AdapterRegistry({"good": good}))
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post("/api/query", json={"question": "Who?"})
+        assert response.status_code == 200
+        assert response.json()["status"] == "partial"
+        assert response.json()["model_comparison"][1]["provider_status"] == "unavailable"
+        response = await client.post("/api/query", json={"question": "Who?", "models": ["missing"]})
+        assert response.status_code == 422
+
 
 @pytest.mark.asyncio
 async def test_payload_rate_limit_and_trusted_proxy_boundaries(tmp_path: Path):
@@ -169,6 +186,33 @@ async def test_payload_rate_limit_and_trusted_proxy_boundaries(tmp_path: Path):
         forwarded_for="198.51.100.2",
         trusted_proxies=["10.0.0.1"],
     ) == "203.0.113.9"
+
+
+@pytest.mark.asyncio
+async def test_concurrency_rejects_without_dispatching_an_extra_provider(tmp_path: Path):
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'concurrency.db'}",
+        crosscheck_models="deterministic",
+        max_concurrent_queries=1,
+        rate_limit_requests=100,
+    )
+
+    class SlowDeterministic(DeterministicAdapter):
+        async def generate(self, prompt: str, *, model: str = "deterministic", deadline=None, **options):
+            import asyncio
+
+            await asyncio.sleep(0.08)
+            return await super().generate(prompt, model=model, deadline=deadline, **options)
+
+    adapter = SlowDeterministic()
+    app = create_app(settings=settings, adapters=AdapterRegistry({"deterministic": adapter}))
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        first, second = await __import__("asyncio").gather(
+            client.post("/api/query", json={"question": "first"}),
+            client.post("/api/query", json={"question": "second"}),
+        )
+    assert sorted((first.status_code, second.status_code)) == [200, 429]
+    assert adapter.prompts and len(adapter.prompts) == 1
 
 
 @pytest.mark.asyncio

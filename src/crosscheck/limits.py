@@ -137,3 +137,9 @@ class NonBlockingConcurrency:
     def release(self) -> None:
         self._semaphore.release()
 
+
+# Friendly compatibility names for deployments/tests that refer to the boundary
+# abstractions generically rather than by their implementation detail.
+RateLimiter = SlidingWindowRateLimiter
+ConcurrencyLimiter = NonBlockingConcurrency
+resolve_client_ip = client_identity

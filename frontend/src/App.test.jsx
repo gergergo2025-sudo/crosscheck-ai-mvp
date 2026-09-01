@@ -64,4 +64,26 @@ describe("single-turn question form", () => {
     expect(screen.getByText("Degraded plain text")).toBeInTheDocument();
     expect(screen.getByText(/Provider status: protocol_error/)).toBeInTheDocument();
   });
+
+  it("surfaces partial provider status and keeps unsafe evidence non-clickable", async () => {
+    const partial = {
+      ...report,
+      status: "partial",
+      warnings: ["A provider timed out."],
+      model_comparison: [{ ...report.model_comparison[0], provider_status: "timeout", retry_count: 2, failure_class: "deadline" }],
+      evidence: [
+        { url: "javascript:alert(1)", title: "unsafe" },
+        { url: "https://example.com/source", title: "safe" },
+      ],
+    };
+    vi.spyOn(globalThis, "fetch").mockResolvedValue({ ok: true, json: async () => partial });
+    render(<App />);
+    const input = screen.getByLabelText("Question");
+    fireEvent.change(input, { target: { value: "Who?" } });
+    fireEvent.submit(input.closest("form"));
+    await waitFor(() => expect(screen.getByText("timeout", { selector: "strong" })).toBeInTheDocument());
+    expect(screen.getByText(/2 retries/)).toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: /javascript/i })).not.toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "example.com" })).toHaveAttribute("rel", "noreferrer noopener");
+  });
 });
