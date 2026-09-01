@@ -120,6 +120,15 @@ class Claim(FlexibleResponseModel):
             raise ValueError("claim must not be blank")
         return value
 
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def confidence_must_be_numeric(cls, value: object) -> object:
+        # Pydantic considers bool an int, but a model's ``true``/``false`` is not
+        # a valid self-reported confidence number for this contract.
+        if isinstance(value, bool):
+            raise ValueError("confidence must be a number")
+        return value
+
 
 class StructuredAnswer(FlexibleResponseModel):
     answer: str = Field(min_length=1, max_length=100_000)

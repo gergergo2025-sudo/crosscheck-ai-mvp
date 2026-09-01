@@ -28,9 +28,9 @@ from .errors import (
     ReportPersistenceUnavailable,
     RequestValidationError,
 )
-from .parser import parse_structured_answer
+from .parser import parse_with_repair
 from .persistence import PersistenceError, ReportStore
-from .prompt import build_unified_prompt
+from .prompt import build_repair_prompt, build_unified_prompt
 from .verifiers import VerifierRegistry
 
 
@@ -50,6 +50,41 @@ def _safe_failure_class(exc: BaseException) -> str:
     if isinstance(exc, AdapterError):
         return getattr(exc, "failure_class", "adapter_error")
     return "adapter_error"
+
+
+def _merge_token_usage(
+    first: dict[str, Any] | None,
+    second: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Combine usage from the initial generation and bounded repair call."""
+
+    if first is None and second is None:
+        return None
+    merged = dict(first or {})
+    for key, value in (second or {}).items():
+        previous = merged.get(key)
+        if isinstance(previous, (int, float)) and isinstance(value, (int, float)) and not isinstance(previous, bool) and not isinstance(value, bool):
+            merged[key] = previous + value
+        elif key not in merged:
+            merged[key] = value
+    return merged
+
+
+def _merge_adapter_results(first: AdapterResult, second: AdapterResult | None) -> AdapterResult:
+    """Retain provider identity while accounting for repair-call metadata."""
+
+    if second is None:
+        return first
+    return first.model_copy(
+        update={
+            "latency_ms": (first.latency_ms or 0.0) + (second.latency_ms or 0.0),
+            "token_usage": _merge_token_usage(first.token_usage, second.token_usage),
+            "reported_cost": (first.reported_cost or 0.0) + (second.reported_cost or 0.0)
+            if first.reported_cost is not None or second.reported_cost is not None
+            else None,
+            "retry_count": first.retry_count,
+        }
+    )
 
 
 class QueryService:
@@ -169,6 +204,7 @@ class QueryService:
         model_answers: list[ModelAnswer] = []
         raw_by_answer: dict[UUID, str] = {}
         failures: list[tuple[str, BaseException]] = []
+        degraded_models: list[str] = []
         verification_by_claim: dict[UUID, list[VerificationResult]] = {}
 
         for model, adapter_result, failure in results:
@@ -193,8 +229,34 @@ class QueryService:
 
             answer_id = uuid4()
             raw_text = _bounded_text(adapter_result.raw_text, self.settings.max_raw_response_chars)
-            parsed = parse_structured_answer(raw_text, max_chars=self.settings.max_raw_response_chars)
+            repair_result: AdapterResult | None = None
+            repair_failure: BaseException | None = None
+
+            async def repair_response(invalid_response: str) -> str:
+                nonlocal repair_result, repair_failure
+                repair_prompt = build_repair_prompt(
+                    invalid_response,
+                    original_prompt=prompt,
+                    version=self.settings.prompt_version,
+                    max_chars=min(self.settings.max_raw_response_chars, 30_000),
+                )
+                _, repair_result, repair_failure = await self._call_adapter(
+                    model,
+                    repair_prompt,
+                    deadline=deadline,
+                )
+                if repair_failure is not None or repair_result is None:
+                    raise repair_failure or RuntimeError("repair did not return a response")
+                return _bounded_text(repair_result.raw_text, self.settings.max_raw_response_chars)
+
+            parsed = await parse_with_repair(
+                raw_text,
+                repair_response,
+                max_chars=self.settings.max_raw_response_chars,
+            )
+            effective_result = _merge_adapter_results(adapter_result, repair_result)
             if parsed.structured is None:
+                degraded_models.append(model)
                 model_answer = ModelAnswer(
                     id=answer_id,
                     model=model,
@@ -206,12 +268,14 @@ class QueryService:
                     parse_status="degraded",
                     parse_diagnostics=parsed.diagnostics,
                     score=0.0,
-                    latency_ms=adapter_result.latency_ms,
-                    token_usage=adapter_result.token_usage,
-                    reported_cost=adapter_result.reported_cost,
+                    latency_ms=effective_result.latency_ms,
+                    token_usage=effective_result.token_usage,
+                    reported_cost=effective_result.reported_cost,
                     retry_count=adapter_result.retry_count,
                     provider_status=adapter_result.status,
-                    failure_class=adapter_result.failure_class,
+                    failure_class=adapter_result.failure_class or (
+                        _safe_failure_class(repair_failure) if repair_failure is not None else None
+                    ),
                 )
                 model_answers.append(model_answer)
                 raw_by_answer[answer_id] = raw_text
@@ -229,11 +293,11 @@ class QueryService:
                 claims=claims,
                 constraints_check=parsed.structured.constraints_check,
                 parse_status="parsed",
-                parse_diagnostics=[],
+                parse_diagnostics=parsed.diagnostics,
                 score=0.0,
-                latency_ms=adapter_result.latency_ms,
-                token_usage=adapter_result.token_usage,
-                reported_cost=adapter_result.reported_cost,
+                latency_ms=effective_result.latency_ms,
+                token_usage=effective_result.token_usage,
+                reported_cost=effective_result.reported_cost,
                 retry_count=adapter_result.retry_count,
                 provider_status=adapter_result.status,
                 failure_class=adapter_result.failure_class,
@@ -260,6 +324,12 @@ class QueryService:
 
         status = "partial" if failures else "complete"
         warnings = [f"model '{model}' was unavailable" for model, _ in failures]
+        if degraded_models:
+            status = "partial"
+            warnings.extend(
+                f"model '{model}' returned an unparseable structured answer; shown as degraded"
+                for model in degraded_models
+            )
         if any(
             claim.verification_status == "unavailable"
             for answer in model_answers

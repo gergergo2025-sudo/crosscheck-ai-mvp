@@ -80,7 +80,9 @@ def create_app(
     resolved_settings = settings or get_settings()
     database = store.database if store is not None else Database(resolved_settings.database_url)
     resolved_store = store or ReportStore(database)
-    resolved_adapters = adapters or default_adapter_registry(resolved_settings.configured_models())
+    resolved_adapters = adapters or default_adapter_registry(
+        resolved_settings.configured_models(), settings=resolved_settings
+    )
     resolved_verifiers = verifiers or VerifierRegistry()
 
     @asynccontextmanager

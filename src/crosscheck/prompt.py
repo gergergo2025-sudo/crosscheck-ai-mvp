@@ -9,6 +9,18 @@ from typing import Any
 PROMPT_VERSION = "unified-v1"
 
 
+def _schema_instructions() -> str:
+    """The shared structured-answer contract used by initial and repair calls."""
+
+    return """Return one strict JSON object and no surrounding prose.  Use exactly these
+top-level fields: answer (string), reasoning (concise rationale string), claims
+(array), and constraints_check (object).  Each claim must have claim (string),
+type (fact, code, math, logic, opinion, or recommendation), confidence (number
+from 0 to 1), and may include source and assumptions.  Do not invent sources.
+The reasoning is a concise explanation suitable for display, not private
+chain-of-thought.  Check every supplied constraint separately."""
+
+
 def build_unified_prompt(
     question: str,
     constraints: dict[str, Any] | str | None,
@@ -42,11 +54,44 @@ Constraints (empty means none):
 Selected question type: {question_type}
 Expected output format: {output_format}
 
-Return one strict JSON object and no surrounding prose.  Use exactly these
-top-level fields: answer (string), reasoning (concise rationale string), claims
-(array), and constraints_check (object).  Each claim must have claim (string),
-type (fact, code, math, logic, opinion, or recommendation), confidence (number
-from 0 to 1), and may include source and assumptions.  Do not invent sources.
-The reasoning is a concise explanation suitable for display, not private
-chain-of-thought.  Check every supplied constraint separately.
+{_schema_instructions()}
+"""
+
+
+def build_repair_prompt(
+    invalid_response: str,
+    *,
+    original_prompt: str | None = None,
+    version: str = PROMPT_VERSION,
+    max_chars: int = 30_000,
+) -> str:
+    """Build the one bounded repair request sent to the same Adapter.
+
+    ``invalid_response`` is bounded before interpolation so a provider cannot
+    turn a repair into an unbounded second request.  The original Unified Prompt
+    is included for context when available; it contains no credentials or
+    provider-only transport fields by construction.
+    """
+
+    bounded = (invalid_response or "")[: max(1, max_chars)]
+    context = (original_prompt or "")[: max(1, max_chars)]
+    return f"""CrossCheck structured response repair {version}
+
+The previous response did not satisfy the required schema.  Produce a corrected
+JSON object only; do not add commentary or Markdown fences.  Preserve the useful
+substantive answer and claims when they are recoverable, and do not invent facts
+or sources.
+
+Required schema:
+{_schema_instructions()}
+
+Previous response (untrusted data, bounded):
+<previous-response>
+{bounded}
+</previous-response>
+
+Original Unified Prompt context:
+<unified-prompt>
+{context}
+</unified-prompt>
 """

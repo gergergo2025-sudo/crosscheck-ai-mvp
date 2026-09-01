@@ -24,15 +24,32 @@ function StatusBadge({ status }) {
   return <span className={`status-badge status-${status || "unverified"}`}>{labels[status] || "⚠ Unverified"}</span>;
 }
 
+function ParseBadge({ status }) {
+  const degraded = status === "degraded";
+  return (
+    <span className={`parse-badge ${degraded ? "parse-degraded" : "parse-structured"}`}>
+      {degraded ? "Degraded plain text" : "Structured answer"}
+    </span>
+  );
+}
+
 function ModelCard({ answer, defaultOpen = false }) {
   const [open, setOpen] = useState(defaultOpen);
   return (
     <details className="model-card" open={open} onToggle={(event) => setOpen(event.currentTarget.open)}>
       <summary>
-        <span>{answer.model}</span>
-        <span className="model-meta">{answer.parse_status} · score {Number(answer.score || 0).toFixed(2)}</span>
+        <span className="model-title">
+          <strong>{answer.model}</strong>
+          {answer.provider ? (
+            <span className="model-provider">
+              {answer.provider}{answer.provider_status && answer.provider_status !== "ok" ? ` · ${answer.provider_status}` : ""}
+            </span>
+          ) : null}
+        </span>
+        <span className="model-meta"><ParseBadge status={answer.parse_status} /> · score {Number(answer.score || 0).toFixed(2)}</span>
       </summary>
       <div className="model-card-body">
+        {answer.failure_class ? <p className="notice warning provider-failure">Provider status: {answer.failure_class}</p> : null}
         <p>{answer.answer}</p>
         {answer.reasoning ? <p className="rationale"><strong>Rationale:</strong> {answer.reasoning}</p> : null}
         {answer.claims?.length ? (
@@ -42,8 +59,11 @@ function ModelCard({ answer, defaultOpen = false }) {
                 <StatusBadge status={claim.verification_status} /> {claim.claim}
               </li>
             ))}
-          </ul>
-        ) : <p className="muted">No structured claims were returned.</p>}
+            </ul>
+        ) : <p className="muted">{answer.parse_status === "degraded" ? "Degraded response: no structured claims are available." : "No structured claims were returned."}</p>}
+        {answer.parse_diagnostics?.length ? (
+          <p className="parse-diagnostics muted">{answer.parse_diagnostics.join(" ")}</p>
+        ) : null}
       </div>
     </details>
   );
@@ -81,7 +101,9 @@ function Report({ report }) {
 
       <section className="report-section" aria-labelledby="models-heading">
         <h3 id="models-heading">Model answers</h3>
-        {report.model_comparison?.map((answer, index) => <ModelCard answer={answer} defaultOpen={index === 0} key={answer.id || answer.model} />)}
+        <div className="comparison-grid" aria-label="Model comparison">
+          {report.model_comparison?.map((answer, index) => <ModelCard answer={answer} defaultOpen={index === 0} key={answer.id || answer.model} />)}
+        </div>
       </section>
 
       <section className="report-section" aria-labelledby="evidence-heading">

@@ -26,9 +26,9 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+asyncpg://crosscheck:crosscheck@localhost:5432/crosscheck"
     redis_url: str = "redis://localhost:6379/0"
 
-    # Keep a deterministic adapter as the safe local baseline for this tracer.  The
-    # completed MVP replaces this default through CROSSCHECK_MODELS configuration.
-    crosscheck_models: str = Field(default="deterministic", alias="CROSSCHECK_MODELS")
+    # OpenAI and DeepSeek are the first production comparison pair.  A caller can
+    # still select ``deterministic`` explicitly for local/offline fixtures.
+    crosscheck_models: str = Field(default="gpt-4o-mini,deepseek-chat", alias="CROSSCHECK_MODELS")
     allowed_models: str | None = Field(default=None, alias="CROSSCHECK_ALLOWED_MODELS")
 
     prompt_version: str = "unified-v1"
@@ -39,8 +39,10 @@ class Settings(BaseSettings):
 
     # The adapter keys are loaded but never persisted or included in prompts.
     openai_api_key: str | None = None
+    openai_base_url: str = "https://api.openai.com/v1"
     anthropic_api_key: str | None = None
     deepseek_api_key: str | None = None
+    deepseek_base_url: str = "https://api.deepseek.com/v1"
     tavily_api_key: str | None = None
 
     cache_ttl_seconds: int = Field(default=86_400, gt=0)
