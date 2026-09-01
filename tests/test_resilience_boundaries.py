@@ -100,6 +100,25 @@ async def test_retry_runner_is_bounded_and_honors_retry_after():
     assert getattr(raised.value, "retry_count", None) == 2
     assert max(sleeps) <= 5
 
+    class ConnectionFlaky(FlakyAdapter):
+        async def generate(self, prompt: str, *, model: str, deadline=None, **kwargs):
+            del prompt, model, deadline, kwargs
+            self.calls += 1
+            if self.calls == 1:
+                raise ConnectionError("transient connection")
+            return AdapterResult(raw_text='{"answer":"ok","claims":[],"constraints_check":{}}', provider="mock", model="mock")
+
+    result = await call_with_retries(
+        ConnectionFlaky(),
+        "prompt",
+        model="mock",
+        deadline=time.monotonic() + 10_000,
+        policy=RetryPolicy(jitter_seconds=0),
+        sleeper=fake_sleep,
+        random_fn=lambda: 0,
+    )
+    assert result.retry_count == 1
+
 
 @pytest.mark.asyncio
 async def test_http_partial_report_and_all_failures_are_not_durable(tmp_path: Path):
@@ -123,6 +142,34 @@ async def test_http_partial_report_and_all_failures_are_not_durable(tmp_path: Pa
         assert body["status"] == "partial"
         assert any(item["model"] == "bad" and item["provider_status"] == "unavailable" for item in body["model_comparison"])
         assert "secret" not in response.text
+
+    class MetadataLeak(FlakyAdapter):
+        async def generate(self, prompt: str, *, model: str, deadline=None, **kwargs):
+            del prompt, deadline, kwargs
+            return AdapterResult(
+                raw_text=json.dumps(
+                    {
+                        "answer": "metadata",
+                        "claims": [],
+                        "constraints_check": {},
+                    }
+                ),
+                provider="safe",
+                model=model,
+                token_usage={"total_tokens": 3, "api_key": "secret"},
+                failure_class="secret-key",
+            )
+
+    metadata_settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'metadata.db'}",
+        crosscheck_models="metadata",
+    )
+    app = create_app(settings=metadata_settings, adapters=AdapterRegistry({"metadata": MetadataLeak()}))
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post("/api/query", json={"question": "Who?"})
+        assert response.status_code == 200
+        assert "secret" not in response.text
+        assert response.json()["model_comparison"][0]["token_usage"] == {"total_tokens": 3}
 
     all_bad = AdapterRegistry({"bad": Bad()})
     settings_all_bad = Settings(

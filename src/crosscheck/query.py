@@ -112,6 +112,20 @@ _SAFE_PROVIDER_STATUSES = {
     "permanent",
     "error",
 }
+_SAFE_FAILURE_CLASSES = {
+    "adapter_error",
+    "adapter_unavailable",
+    "unavailable",
+    "timeout",
+    "deadline",
+    "retryable",
+    "http_retryable",
+    "http_permanent",
+    "permanent",
+    "provider_error",
+    "verifier_error",
+    "cost_ceiling",
+}
 
 
 def _safe_provider_status(value: object, *, default: str = "error") -> str:
@@ -124,6 +138,41 @@ def _safe_provider_name(value: object, fallback: str = "unknown") -> str:
     if not candidate or len(candidate) > 100 or not re.fullmatch(r"[A-Za-z0-9._:-]+", candidate):
         return fallback
     return candidate
+
+
+def _safe_failure_value(value: object, *, default: str | None = None) -> str | None:
+    if value is None:
+        return default
+    candidate = str(value).strip().casefold()
+    if candidate in _SAFE_FAILURE_CLASSES:
+        return candidate
+    return default
+
+
+def _sanitize_token_usage(value: object) -> dict[str, int | float] | None:
+    if not isinstance(value, Mapping):
+        return None
+    safe: dict[str, int | float] = {}
+    allowed = {
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "input_tokens",
+        "output_tokens",
+        "cached_tokens",
+    }
+    for key, raw in value.items():
+        name = str(key).strip().casefold()
+        if name not in allowed:
+            continue
+        try:
+            number = float(raw)
+            if not math.isfinite(number) or number < 0:
+                continue
+            safe[name] = int(number) if number.is_integer() else min(number, 1_000_000_000.0)
+        except (TypeError, ValueError):
+            continue
+    return safe or None
 
 
 def _safe_http_url(value: object) -> str | None:
@@ -615,7 +664,7 @@ class QueryService:
                         parse_diagnostics=["provider call did not produce a usable result"],
                         score=0.0,
                         provider_status=status,
-                        failure_class=failure_class,
+                        failure_class=_safe_failure_value(failure_class, default="provider_error"),
                         retry_count=max(0, int(getattr(failure, "retry_count", 0))),
                     )
                 )
@@ -649,7 +698,7 @@ class QueryService:
                         parse_diagnostics=["provider returned no answer text"],
                         score=0.0,
                         provider_status=provider_status,
-                        failure_class=_safe_failure_class(failure),
+                        failure_class=_safe_failure_value(_safe_failure_class(failure), default="provider_error"),
                         retry_count=adapter_result.retry_count,
                     )
                 )
@@ -695,12 +744,13 @@ class QueryService:
                     parse_diagnostics=parsed.diagnostics,
                     score=0.0,
                     latency_ms=effective_result.latency_ms,
-                    token_usage=effective_result.token_usage,
+                    token_usage=_sanitize_token_usage(effective_result.token_usage),
                     reported_cost=effective_result.reported_cost,
                     retry_count=adapter_result.retry_count,
                     provider_status=provider_status,
-                    failure_class=adapter_result.failure_class or (
-                        _safe_failure_class(repair_failure) if repair_failure is not None else None
+                    failure_class=_safe_failure_value(
+                        adapter_result.failure_class
+                        or (_safe_failure_class(repair_failure) if repair_failure is not None else None)
                     ),
                 )
                 model_answers.append(model_answer)
@@ -724,11 +774,11 @@ class QueryService:
                 parse_diagnostics=parsed.diagnostics,
                 score=0.0,
                 latency_ms=effective_result.latency_ms,
-                token_usage=effective_result.token_usage,
+                token_usage=_sanitize_token_usage(effective_result.token_usage),
                 reported_cost=effective_result.reported_cost,
                 retry_count=adapter_result.retry_count,
                 provider_status=provider_status,
-                failure_class=adapter_result.failure_class,
+                failure_class=_safe_failure_value(adapter_result.failure_class),
             )
             model_answers.append(model_answer)
             raw_by_answer[answer_id] = raw_text

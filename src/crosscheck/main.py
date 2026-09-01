@@ -44,16 +44,19 @@ class Runtime:
         adapters: AdapterRegistry,
         verifiers: VerifierRegistry,
         classifier: Classifier | None,
-        rate_limiter: SlidingWindowRateLimiter,
-        concurrency: NonBlockingConcurrency,
+        rate_limiter: SlidingWindowRateLimiter | None = None,
+        concurrency: NonBlockingConcurrency | None = None,
     ) -> None:
         self.settings = settings
         self.store = store
         self.adapters = adapters
         self.verifiers = verifiers
         self.classifier = classifier
-        self.rate_limiter = rate_limiter
-        self.concurrency = concurrency
+        self.rate_limiter = rate_limiter or SlidingWindowRateLimiter(
+            settings.rate_limit_requests,
+            settings.rate_limit_window_seconds,
+        )
+        self.concurrency = concurrency or NonBlockingConcurrency(settings.max_concurrent_queries)
         self.query_service = QueryService(
             settings=settings,
             store=store,

@@ -171,7 +171,19 @@ def _retryable_exception(exc: BaseException) -> bool:
     # ``httpx`` is optional at this module boundary, so classify its transport
     # hierarchy by name rather than importing an SDK/type at import time.
     name = type(exc).__name__.lower()
-    return any(token in name for token in ("timeout", "connecterror", "networkerror", "readerror", "writeerror"))
+    return any(
+        token in name
+        for token in (
+            "timeout",
+            "connecterror",
+            "connectionerror",
+            "networkerror",
+            "readerror",
+            "writeerror",
+            "remoteprotocol",
+            "protocolerror",
+        )
+    )
 
 
 def _retry_after_seconds(exc: BaseException, policy: RetryPolicy) -> float | None:
