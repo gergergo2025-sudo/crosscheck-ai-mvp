@@ -139,6 +139,7 @@ class ReportStore:
         request_id: UUID,
         raw_by_answer: dict[UUID, str] | None = None,
         verification_by_claim: dict[UUID, list[VerificationResult]] | None = None,
+        clusters: Any | None = None,
         cache_key: str | None = None,
         cache_key_version: str | None = None,
     ) -> ReportResponse:
@@ -174,6 +175,36 @@ class ReportStore:
                     },
                 )
                 await self._hook("question")
+
+                # Clusters are written before Claims so a Claim's cluster foreign
+                # key always resolves inside the same transaction.
+                for cluster in getattr(clusters, "clusters", []) or []:
+                    await connection.execute(
+                        _json_bind(
+                            """INSERT INTO claim_clusters
+                            (id, question_id, representative_text, clustering_method,
+                             clustering_version, threshold, verification_status,
+                             supporting_models, oppose_models, created_at)
+                            VALUES (:id, :question_id, :representative_text,
+                             :clustering_method, :clustering_version, :threshold,
+                             :verification_status, :supporting_models,
+                             :oppose_models, :created_at)""",
+                            {"supporting_models", "oppose_models"},
+                        ),
+                        {
+                            "id": str(cluster.id),
+                            "question_id": str(report.question.id),
+                            "representative_text": cluster.representative_text,
+                            "clustering_method": getattr(clusters, "method", "none"),
+                            "clustering_version": getattr(clusters, "version", "0"),
+                            "threshold": getattr(clusters, "threshold", None),
+                            "verification_status": cluster.verification_status,
+                            "supporting_models": list(cluster.supporting_models),
+                            "oppose_models": list(cluster.oppose_models),
+                            "created_at": created_at,
+                        },
+                    )
+                await self._hook("cluster")
 
                 for answer in report.model_comparison:
                     await connection.execute(

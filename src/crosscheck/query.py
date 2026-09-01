@@ -23,7 +23,11 @@ from .adapters import (
     call_with_retries,
 )
 from .classification import Classifier, resolve_classification
+from .clustering import ClaimClusterer, ClusteringOutcome, NullClusterer
+from .cache import NullReportCache, ReportCache, build_cache_key
 from .config import Settings
+from .constraints import ConstraintOutcome, ConstraintService, ReportedConstraintService
+from .consensus import build_consensus_and_disagreements
 from .contracts import (
     Claim,
     ModelAnswer,
@@ -41,6 +45,8 @@ from .errors import (
 from .parser import parse_with_repair
 from .persistence import PersistenceError, ReportStore
 from .prompt import build_repair_prompt, build_unified_prompt
+from .scoring import NeutralScorer, Scorer, ScoringOutcome
+from .telemetry import NullTelemetry, Telemetry
 from .verifiers import VerifierRegistry
 
 
@@ -243,6 +249,32 @@ def _sanitize_evidence(evidence: object, *, max_count: int, max_snippet_chars: i
     return safe
 
 
+def _apply_cluster_ids(
+    answers: list[ModelAnswer],
+    clustering: ClusteringOutcome,
+) -> list[ModelAnswer]:
+    """Attach Cluster identity back to each Claim for traceable Consensus."""
+
+    if not clustering.clusters:
+        return answers
+    cluster_by_claim = {
+        claim_id: cluster.id for cluster in clustering.clusters for claim_id in cluster.claim_ids
+    }
+    if not cluster_by_claim:
+        return answers
+    return [
+        answer.model_copy(
+            update={
+                "claims": [
+                    claim.model_copy(update={"cluster_id": cluster_by_claim.get(claim.id, claim.cluster_id)})
+                    for claim in answer.claims
+                ]
+            }
+        )
+        for answer in answers
+    ]
+
+
 class QueryService:
     """Coordinates ports and persists one immutable Report graph per request."""
 
@@ -254,6 +286,11 @@ class QueryService:
         adapters: AdapterRegistry,
         verifiers: VerifierRegistry | None = None,
         classifier: Classifier | None = None,
+        clusterer: ClaimClusterer | None = None,
+        scorer: Scorer | None = None,
+        constraint_service: ConstraintService | None = None,
+        cache: ReportCache | None = None,
+        telemetry: Telemetry | None = None,
         clock: Any | None = None,
         sleeper: Any | None = None,
         random_fn: Any | None = None,
@@ -263,14 +300,85 @@ class QueryService:
         self.adapters = adapters
         self.verifiers = verifiers or VerifierRegistry()
         self.classifier = classifier
+        # Pipeline stages are ports so clustering, verification, scoring, cache and
+        # telemetry behaviour can be replaced without touching orchestration.
+        self.clusterer = clusterer or NullClusterer()
+        self.scorer = scorer or NeutralScorer()
+        self.constraint_service = constraint_service or ReportedConstraintService()
+        self.cache = cache or NullReportCache()
+        self.telemetry = telemetry or NullTelemetry()
         # Ports are injectable for deterministic fake-clock/provider contract
         # tests.  ``clock`` may be a callable or an object exposing ``monotonic``.
         self.clock = clock if callable(clock) else getattr(clock, "monotonic", time.monotonic)
         self.sleeper = sleeper or asyncio.sleep
         self.random_fn = random_fn
 
-    def _retry_policy(self) -> RetryPolicy:
-        return RetryPolicy(
+    def behaviour_versions(self) -> dict[str, Any]:
+        """Return every behaviour version that must participate in the cache key."""
+
+        return {
+            "prompt": self.settings.prompt_version,
+            "adapters": getattr(self.adapters, "configuration_version", "1"),
+            "clustering": f"{getattr(self.clusterer, 'method', 'none')}:{getattr(self.clusterer, 'version', '0')}",
+            "verifiers": getattr(self.verifiers, "version_set", lambda: "none")(),
+            "scoring": getattr(self.scorer, "version", "0"),
+        }
+
+    async def _cluster_claims(
+        self,
+        answers: list[ModelAnswer],
+        *,
+        deadline: float,
+    ) -> ClusteringOutcome:
+        """Cluster Claims without letting a clustering failure fail the Report."""
+
+        try:
+            outcome = await asyncio.wait_for(
+                self.clusterer.cluster(answers, deadline=deadline),
+                timeout=max(0.001, deadline - self.clock()),
+            )
+        except asyncio.CancelledError:
+            raise
+        except BaseException:
+            return ClusteringOutcome(
+                method="unavailable",
+                degraded=True,
+                warnings=["claim clustering was unavailable; consensus grouping is degraded"],
+            )
+        self.telemetry.emit(
+            "clustering.completed",
+            method=outcome.method,
+            version=outcome.version,
+            threshold=outcome.threshold,
+            degraded=outcome.degraded,
+            cluster_count=len(outcome.clusters),
+        )
+        return outcome
+
+    async def _check_constraints(
+        self,
+        request: QueryRequest,
+        answers: list[ModelAnswer],
+        *,
+        deadline: float,
+    ) -> ConstraintOutcome:
+        """Run per-Constraint verification without failing the whole Report."""
+
+        try:
+            outcome = await asyncio.wait_for(
+                self.constraint_service.check(request, answers, deadline=deadline),
+                timeout=max(0.001, deadline - self.clock()),
+            )
+        except asyncio.CancelledError:
+            raise
+        except BaseException:
+            return ConstraintOutcome(
+                warnings=["constraint verification was unavailable"],
+            )
+        self.telemetry.emit("constraints.completed", constraint_count=len(outcome.aggregate))
+        return outcome
+
+    def _retry_policy(self) -> RetryPolicy:        return RetryPolicy(
             attempt_timeout_seconds=self.settings.adapter_attempt_timeout_seconds,
             max_retries=self.settings.adapter_max_retries,
             backoff_base_seconds=self.settings.retry_backoff_base_seconds,
@@ -631,12 +739,36 @@ class QueryService:
             request.expected_output_format,
             version=self.settings.prompt_version,
         )
+        cache_key = build_cache_key(
+            request,
+            models=selected_models,
+            question_type=classification.question_type,
+            versions=self.behaviour_versions(),
+        )
+        self.telemetry.emit(
+            "query.started",
+            request_id=str(request_id),
+            question_type=classification.question_type,
+            question_type_origin=classification.origin,
+            model_count=len(selected_models),
+            question_length=len(request.question),
+        )
+        if not request.refresh:
+            cached = await self.cache.get(cache_key)
+            if cached is not None:
+                self.telemetry.emit("cache.hit", request_id=str(request_id), report_id=str(cached.report_id))
+                return cached.model_copy(update={"cached": True})
+            self.telemetry.emit("cache.miss", request_id=str(request_id))
 
         results = await self._fan_out_adapters(selected_models, prompt, deadline=deadline)
         model_answers: list[ModelAnswer] = []
         raw_by_answer: dict[UUID, str] = {}
         failures: list[tuple[str, BaseException]] = []
         degraded_models: list[str] = []
+        # A provider that returned text produces a Report entry even when its
+        # structured output could not be repaired; only providers that never
+        # answered are excluded from the Report.
+        responded_answer_ids: set[UUID] = set()
         verification_by_claim: dict[UUID, list[VerificationResult]] = {}
         reported_cost = 0.0
 
@@ -756,6 +888,7 @@ class QueryService:
                 model_answers.append(model_answer)
                 raw_by_answer[answer_id] = raw_text
                 degraded_models.append(model)
+                responded_answer_ids.add(answer_id)
                 continue
 
             claims = [
@@ -782,11 +915,14 @@ class QueryService:
             )
             model_answers.append(model_answer)
             raw_by_answer[answer_id] = raw_text
+            responded_answer_ids.add(answer_id)
 
         usable_answers = [answer for answer in model_answers if answer.parse_status == "parsed" and answer.answer.strip()]
-        if not usable_answers:
-            # All-provider failures and all-degraded responses are intentionally
-            # non-durable: no empty or misleading Report enters persistence/cache.
+        report_answers = [answer for answer in model_answers if answer.id in responded_answer_ids]
+        if not report_answers:
+            # All-provider failures are intentionally non-durable: no empty or
+            # misleading Report enters persistence/cache.  A provider that did
+            # answer, even unparseably, still deserves an inspectable Report.
             raise NoUsableModelAnswer()
 
         model_answers, verification_by_claim = await self._verify_claims(
@@ -794,6 +930,34 @@ class QueryService:
             question=request.question,
             constraints=request.constraints,
             deadline=deadline,
+        )
+        clustering = await self._cluster_claims(model_answers, deadline=deadline)
+        model_answers = _apply_cluster_ids(model_answers, clustering)
+        constraint_outcome = await self._check_constraints(request, model_answers, deadline=deadline)
+        consensus, disagreements = build_consensus_and_disagreements(
+            model_answers,
+            clustering=clustering,
+            verification_by_claim=verification_by_claim,
+        )
+        scoring = self.scorer.score(
+            model_answers,
+            clustering=clustering,
+            verification_by_claim=verification_by_claim,
+            constraint_results=constraint_outcome.per_answer,
+            usable_provider_count=len({answer.provider for answer in usable_answers}),
+        )
+        model_answers = [
+            answer.model_copy(
+                update={
+                    "score": scoring.scores.get(answer.id, 0.0),
+                    "score_components": scoring.components.get(answer.id, {}),
+                }
+            )
+            for answer in model_answers
+        ]
+        recommended_answer = next(
+            (answer for answer in model_answers if answer.id == scoring.recommended_answer_id),
+            None,
         )
         status = "partial" if failures or degraded_models else "complete"
         warnings: list[str] = []
@@ -810,6 +974,10 @@ class QueryService:
                 f"model '{model}' returned an unparseable structured answer; shown as degraded"
                 for model in degraded_models
             )
+        warnings.extend(clustering.warnings)
+        warnings.extend(constraint_outcome.warnings)
+        warnings.extend(scoring.warnings)
+        warnings.extend(self.cache.warnings())
         if self.settings.max_query_cost_usd is not None and reported_cost > self.settings.max_query_cost_usd:
             warnings.append("reported provider usage exceeded the configured cost ceiling")
         if any(
@@ -830,11 +998,8 @@ class QueryService:
             expected_output_format=request.expected_output_format,
             models=selected_models,
         )
-        aggregate_constraints: dict[str, Any] = {}
         all_evidence: list[dict[str, Any]] = []
         for answer in model_answers:
-            for key, value in answer.constraints_check.items():
-                aggregate_constraints.setdefault(key, []).append({"model": answer.model, "result": value})
             for claim in answer.claims:
                 for verification in verification_by_claim.get(claim.id, []):
                     all_evidence.extend(verification.evidence)
@@ -850,13 +1015,13 @@ class QueryService:
             created_at=datetime.now(timezone.utc),
             duration_ms=(time.perf_counter() - started) * 1000,
             question=question_summary,
-            recommended_answer=None,
-            recommendation_message="Verification and scoring are not yet sufficient for an automated recommendation.",
-            consensus=[],
-            disagreements=[],
+            recommended_answer=recommended_answer,
+            recommendation_message=scoring.recommendation_message,
+            consensus=consensus,
+            disagreements=disagreements,
             model_comparison=model_answers,
             evidence=evidence,
-            constraints_check=aggregate_constraints,
+            constraints_check=constraint_outcome.aggregate,
             warnings=warnings,
         )
         try:
@@ -866,7 +1031,19 @@ class QueryService:
                 request_id=request_id,
                 raw_by_answer=raw_by_answer,
                 verification_by_claim=verification_by_claim,
+                clusters=clustering,
             )
         except PersistenceError as exc:
             raise ReportPersistenceUnavailable() from exc
+        await self.cache.set(cache_key, report)
+        self.telemetry.emit(
+            "query.completed",
+            request_id=str(request_id),
+            report_id=str(report_id),
+            status=status,
+            cached=False,
+            duration_ms=report.duration_ms,
+            model_count=len(model_answers),
+            usable_model_count=len(usable_answers),
+        )
         return report

@@ -11,8 +11,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from .adapters import AdapterRegistry, default_adapter_registry
+from .cache import ReportCache
 from .classification import Classifier
+from .clustering import ClaimClusterer
 from .config import Settings, get_settings
+from .constraints import ConstraintService
 from .contracts import (
     ErrorDetail,
     ErrorResponse,
@@ -32,6 +35,9 @@ from .errors import (
 from .limits import NonBlockingConcurrency, SlidingWindowRateLimiter, client_identity
 from .persistence import Database, PersistenceError, ReportStore
 from .query import QueryService
+from .scoring import Scorer
+from .telemetry import Telemetry
+from .verifier_registry import default_verifier_registry
 from .verifiers import VerifierRegistry
 
 
@@ -44,6 +50,11 @@ class Runtime:
         adapters: AdapterRegistry,
         verifiers: VerifierRegistry,
         classifier: Classifier | None,
+        clusterer: ClaimClusterer | None = None,
+        scorer: Scorer | None = None,
+        constraint_service: ConstraintService | None = None,
+        cache: ReportCache | None = None,
+        telemetry: Telemetry | None = None,
         rate_limiter: SlidingWindowRateLimiter | None = None,
         concurrency: NonBlockingConcurrency | None = None,
     ) -> None:
@@ -63,6 +74,11 @@ class Runtime:
             adapters=adapters,
             verifiers=verifiers,
             classifier=classifier,
+            clusterer=clusterer,
+            scorer=scorer,
+            constraint_service=constraint_service,
+            cache=cache,
+            telemetry=telemetry,
         )
 
 
@@ -85,6 +101,11 @@ def create_app(
     adapters: AdapterRegistry | None = None,
     verifiers: VerifierRegistry | None = None,
     classifier: Classifier | None = None,
+    clusterer: ClaimClusterer | None = None,
+    scorer: Scorer | None = None,
+    constraint_service: ConstraintService | None = None,
+    cache: ReportCache | None = None,
+    telemetry: Telemetry | None = None,
 ) -> FastAPI:
     """Build an app with injectable ports for HTTP acceptance tests."""
 
@@ -94,7 +115,7 @@ def create_app(
     resolved_adapters = adapters or default_adapter_registry(
         resolved_settings.configured_models(), settings=resolved_settings
     )
-    resolved_verifiers = verifiers or VerifierRegistry()
+    resolved_verifiers = verifiers or default_verifier_registry(resolved_settings)
     rate_limiter = SlidingWindowRateLimiter(
         resolved_settings.rate_limit_requests,
         resolved_settings.rate_limit_window_seconds,
@@ -108,6 +129,11 @@ def create_app(
             adapters=resolved_adapters,
             verifiers=resolved_verifiers,
             classifier=classifier,
+            clusterer=clusterer,
+            scorer=scorer,
+            constraint_service=constraint_service,
+            cache=cache,
+            telemetry=telemetry,
             rate_limiter=rate_limiter,
             concurrency=concurrency,
         )
