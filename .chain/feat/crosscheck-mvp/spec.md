@@ -21,6 +21,7 @@ The Scoring Engine applies the PRD weights to normalized, evidence-backed compon
 The React report experience will show the recommendation or insufficient-confidence state, Consensus, Disagreements, expandable Model Answers, Claim verification badges, Evidence links, Constraint Checks, provider failures, and an AI fallibility notice. Users can submit helpful/not-helpful feedback, identify an erroneous Claim in a comment, or suggest a better answer. PostgreSQL stores the Question, answers, Claims, Verification Results, Report, and feedback. Redis caches exact normalized Question requests for 24 hours by default; it is an optimization, not a source of truth.
 
 The backend remains runnable with `uv run uvicorn crosscheck.main:app --reload`; `GET /health` continues to return exactly `{"status":"ok"}`. Secret values are loaded only from runtime environment variables, never logged or persisted in answer metadata, and `.env.example` contains placeholders only.
+
 ## User Stories
 
 1. As a knowledge worker, I want to submit one natural-language Question, so that I can compare several independent answers without visiting several products.
@@ -93,6 +94,7 @@ The backend remains runnable with `uv run uvicorn crosscheck.main:app --reload`;
 68. As an API consumer, I want machine-readable request, success, partial-success, and error schemas, so that clients can integrate without scraping UI text.
 69. As an API consumer, I want stable identifiers for Reports, Model Answers, Claims, Clusters, and Verification Results, so that feedback and drill-down references remain valid.
 70. As a user, I want only a single-turn Question flow in the MVP, so that the interface is predictable and does not imply conversational memory.
+
 ## Implementation Decisions
 
 ### Product and repository baseline
@@ -168,6 +170,7 @@ The backend remains runnable with `uv run uvicorn crosscheck.main:app --reload`;
 - Consensus coverage is the fraction of that answer's unique Cluster memberships that are both supported by at least two providers and independently verified. It never rewards an unverified majority.
 - Apply assurance caps after the weighted score: a degraded answer scores zero; a query with only one usable provider, or an answer with no successful independent Verification Result, cannot exceed 0.59. A credible conflicting result on a central Claim is reflected as zero for that Claim and keeps the recommendation below the 0.60 threshold until the conflict is resolved.
 - Recommend the highest final score at or above 0.60. Scores are rounded only for display. Exact ties use configured model order for stability and disclose the tie; provider order is not itself a score. If no eligible answer crosses the threshold, `recommended_answer` is null and the prescribed insufficient-confidence message is returned.
+
 ### Persistence and data model
 
 - Use PostgreSQL UUID primary keys, UTC timezone-aware creation timestamps, foreign keys, explicit enums or constrained strings for closed statuses, and JSONB only for genuinely variable structured payloads. Apply schema migrations rather than creating tables implicitly at application startup.
@@ -227,6 +230,7 @@ The backend remains runnable with `uv run uvicorn crosscheck.main:app --reload`;
 - The backend uses migrations as an explicit startup/deployment step. The frontend receives only the public API base URL and other nonsecret build-time settings. Provider keys never enter frontend bundles or browser storage.
 - Preserve the documented local backend command and exact health payload. Document setup, environment placeholders, migration, test, frontend, Docker/Compose, and sandbox-image preparation commands as part of delivery.
 - Prefer compatible additive API and persistence changes during MVP iteration. Version prompt, scoring, clustering, and Verifier behavior in each Report so cached and historical results remain interpretable.
+
 ## Testing Decisions
 
 ### Test philosophy and selected seams
@@ -284,6 +288,7 @@ The backend remains runnable with `uv run uvicorn crosscheck.main:app --reload`;
 
 - The repository currently contains no tests, test configuration, frontend, migrations, or similar integration examples. The only established behavioral prior art is the exact asynchronous FastAPI `GET /health` endpoint and documented uv/Uvicorn startup command.
 - Establish backend prior art with pytest, an async ASGI HTTP client, deterministic dependency overrides, and containerized PostgreSQL/Redis integration fixtures. Establish frontend prior art with Vitest and Testing Library for contract fixtures plus Playwright for the Browser Report seam. Later tests should copy these high-level fixtures and contract builders rather than introduce service-specific mocking styles.
+
 ## Out of Scope
 
 - Multi-turn conversation, conversational memory, streaming follow-up questions, and real-time deep dialogue.
