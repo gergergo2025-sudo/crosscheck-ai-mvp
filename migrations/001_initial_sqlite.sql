@@ -102,6 +102,9 @@ CREATE TABLE IF NOT EXISTS reports (
     evidence JSON NOT NULL,
     warnings JSON NOT NULL,
     prompt_version TEXT NOT NULL,
+    cache_key TEXT,
+    cache_key_version TEXT,
+    report_payload JSON,
     total_duration_ms REAL NOT NULL,
     created_at TEXT NOT NULL,
     UNIQUE(question_id)

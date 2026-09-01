@@ -13,7 +13,7 @@ import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Iterable
+from typing import Any, Awaitable, Callable, Iterable, Mapping
 from uuid import UUID, uuid4
 
 from sqlalchemy import JSON, bindparam, text
@@ -139,6 +139,8 @@ class ReportStore:
         request_id: UUID,
         raw_by_answer: dict[UUID, str] | None = None,
         verification_by_claim: dict[UUID, list[VerificationResult]] | None = None,
+        cache_key: str | None = None,
+        cache_key_version: str | None = None,
     ) -> ReportResponse:
         """Insert Question → Answer → Claim → Verification → Report atomically."""
 
@@ -286,11 +288,13 @@ class ReportStore:
                         (id, question_id, recommended_answer_id, status,
                          recommendation_message, consensus, disagreements,
                          model_scores, constraints_check, evidence, warnings,
-                         prompt_version, total_duration_ms, created_at)
+                         prompt_version, cache_key, cache_key_version,
+                         report_payload, total_duration_ms, created_at)
                         VALUES (:id, :question_id, :recommended_answer_id, :status,
                          :recommendation_message, :consensus, :disagreements,
                          :model_scores, :constraints_check, :evidence, :warnings,
-                         :prompt_version, :total_duration_ms, :created_at)""",
+                         :prompt_version, :cache_key, :cache_key_version,
+                         :report_payload, :total_duration_ms, :created_at)""",
                         {
                             "consensus",
                             "disagreements",
@@ -298,6 +302,7 @@ class ReportStore:
                             "constraints_check",
                             "evidence",
                             "warnings",
+                            "report_payload",
                         },
                     ),
                     {
@@ -318,6 +323,17 @@ class ReportStore:
                         "evidence": report.evidence,
                         "warnings": report.warnings,
                         "prompt_version": "unified-v1",
+                        "cache_key": cache_key,
+                        "cache_key_version": cache_key_version,
+                        # Keep a validated, immutable response snapshot so a
+                        # cache hit can rehydrate the exact public Report while
+                        # PostgreSQL remains authoritative for existence and
+                        # ownership checks.
+                        "report_payload": {
+                            "report": report.model_dump(mode="json"),
+                            "cache_key": cache_key,
+                            "cache_key_version": cache_key_version,
+                        },
                         "total_duration_ms": report.duration_ms,
                         "created_at": created_at,
                     },
