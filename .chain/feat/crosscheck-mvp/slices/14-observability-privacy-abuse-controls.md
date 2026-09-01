@@ -1,16 +1,17 @@
 ---
 id: 14-observability-privacy-abuse-controls
-title: Observable, private, and bounded public flow
+title: Observable and private lifecycle
 blocked_by:
   - 01-durable-query-tracer
 risk: true
 ---
 
-# 14: Observable, private, and bounded public flow
+# 14: Observable and private lifecycle
 
-**What to build:** An operator can monitor correlated query, cache, Adapter, parse, clustering, Verifier, scoring, persistence, sandbox, cost, and feedback outcomes without raw Question, answer, feedback, secret, or upstream-body leakage. The anonymous public API enforces body, field, rate, concurrency, allow-list, outbound-URL, and trusted-proxy boundaries with standard 422/429/502/503 envelopes, while credentials remain environment-only, redacted from exceptions and stored diagnostics, and missing optional integrations never break liveness. This slice owns user stories 59–62 and the central settings, secret handling, structured telemetry, metrics, privacy, sanitization, and abuse-control decisions.
+**What to build:** An operator can monitor correlated query, cache, Adapter, parse, clustering, Verifier, scoring, persistence, sandbox, cost, and feedback outcomes without leaking credentials, raw upstream error bodies, or raw Question, Model Answer, and feedback bodies into ordinary logs, metrics, traces, or diagnostic fields. Credentials remain environment-only and are redacted from exceptions, responses, and persisted diagnostics, while successful Reports and audit records retain the bounded user/model content explicitly required by their contracts. Missing optional integrations never break liveness. This slice owns user stories 59–61 and the secret-handling, structured-telemetry, metrics, privacy, redaction, and sanitization decisions.
 
 **Blocked by:** 01-durable-query-tracer.
 
-- [ ] HTTP and telemetry acceptance tests inject credential-like and sensitive markers into requests and upstream failures and prove correlated events/metrics contain only hashes, lengths, categories, IDs, timing, usage, retry, parse, verification, cache, score, and sanitized status metadata; responses and persisted diagnostics contain no secret marker or raw private body.
-- [ ] Boundary tests prove configurable oversized-body/field rejection, allow-listed models, per-client rate and concurrency limits, trusted-proxy interpretation, HTTP(S)-only Evidence, no arbitrary outbound source fetch, and exact correlated 422/429/502/503 envelopes under bounded load.
+- [ ] HTTP and telemetry acceptance tests inject credential-like markers, raw upstream error markers, and private-body markers and prove logs, metrics, traces, and diagnostic fields contain only approved hashes, lengths, categories, IDs, timing, usage, retry, parse, verification, cache, score, and sanitized status metadata—never credentials, upstream error bodies, or raw Question, Model Answer, and feedback bodies.
+- [ ] Response and persistence tests prove injected credential and upstream-error markers are absent from public errors and all stored records, configuration and exception representations are redacted, and successful 200 Reports plus bounded audit records still retain the contract-required Question and Model Answer content rather than erasing the audit trail.
+- [ ] Lifecycle acceptance tests prove correlated events and metrics cover request start/end, cache outcomes, Adapter retries/latency/usage/cost, parsing and repair, clustering mode, Verifier outcomes, scoring, atomic Report persistence, sandbox outcomes, and feedback creation without making optional integration configuration a liveness dependency.

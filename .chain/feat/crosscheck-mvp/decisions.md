@@ -6,15 +6,15 @@
 - **Rejected alternatives:** Separate horizontal setup slices for schemas, backend services, frontend scaffolding, and tests; or a non-durable in-memory query prototype.
 - **Reason:** The first option would not be independently demoable and would create merge-order ambiguity; the second would violate the requirement that successful Reports be durable and would later force a broad rewrite.
 
-## 2. Use the first tracer as the sole shared prerequisite
+## 2. Use the first tracer as the shared prerequisite
 
-- **Choice:** Every additive feature that relies on the public Report contract blocks only on Slice 01 unless it has a genuine semantic dependency; most of Slices 02–14 can therefore proceed in parallel after one merge.
+- **Choice:** Every additive feature that relies on the public Report contract blocks only on Slice 01 unless it has a genuine semantic dependency; most of Slices 02–14 and 16 can therefore proceed in parallel after one merge. Claude's three-provider integration additionally blocks on the OpenAI/DeepSeek prompt, parser, and Adapter slice because it demonstrates all three production implementations together.
 - **Rejected alternatives:** Give every slice an empty dependency list despite the empty repository, or serialize slices in the PRD's narrative order.
 - **Reason:** Empty dependencies would cause competing schema, route, migration, and frontend foundations, while full serialization would unnecessarily deepen the critical path.
 
 ## 3. Keep the critical path semantic, not organizational
 
-- **Choice:** Verified Consensus alone blocks on clustering, Fact verification, and scoring; final local delivery blocks only on the concrete runtime surfaces it must smoke-test.
+- **Choice:** Verified Consensus blocks on clustering, Fact verification, and scoring; final local delivery blocks on provider deadline/resilience, Docker verification, Report safety, caching, observability/privacy, and public abuse controls because its smoke and release checks directly exercise those runtime surfaces.
 - **Rejected alternatives:** Make Consensus wait for every Verifier and UI enhancement, or add a catch-all integrate-and-verify slice.
 - **Reason:** Consensus needs a clustered independently verified representative and its score effect, but it does not need Constraint or Code verification. Chain-level Merge Gate evidence is explicitly outside the slice set.
 
@@ -26,7 +26,7 @@
 
 ## 5. Separate provider protocol work from resilience policy
 
-- **Choice:** OpenAI/DeepSeek structured comparison, Claude/default registration, and cross-provider retry/deadline/cost policy are separate slices behind the shared Adapter port.
+- **Choice:** OpenAI/DeepSeek structured comparison, Claude/default registration, and cross-provider retry/deadline/cost policy are separate slices behind the shared Adapter port. The Claude/default slice follows the initial pair so it can prove the production three-provider integration without duplicating their prompt, parser, or Adapter work.
 - **Rejected alternatives:** One large “all providers” slice, or provider-specific retry implementations.
 - **Reason:** Protocol contracts can be implemented in parallel, while one policy slice prevents divergent timeout, retry, sanitization, and cost behavior.
 
@@ -56,7 +56,7 @@
 
 ## 10. Mark risk from runtime data effects
 
-- **Choice:** Slices that create or alter PostgreSQL/Redis records or persisted Report content are marked risky; the UI-only Report hardening and final reproducible-delivery slice are not.
+- **Choice:** Slices that create or alter PostgreSQL/Redis records, persisted Report content, or irreversible external telemetry are marked risky. The final reproducible-delivery slice is risky because its smoke path writes a PostgreSQL Report and Redis cache entry and invokes the external Docker sandbox; the UI-only Report hardening and validation-only public control slice remain non-risky.
 - **Rejected alternatives:** Mark every external API call risky, or mark only schema migrations risky.
 - **Reason:** Provider/search calls are bounded and reversible, while stored audit/cache/feedback behavior can affect durable or reused user-visible state.
 
@@ -74,7 +74,7 @@
 
 ## 13. Keep release evidence outside implementation ownership
 
-- **Choice:** Slice 15 wires reproducible runtime and feature-specific nonfunctional checks, but repository Merge Gate and chain-level integration evidence remain outside the slice set.
+- **Choice:** Slice 15 wires reproducible runtime and feature-specific performance, load, migration, secret-scan, and fake-provider smoke checks after the runtime features they exercise, but repository Merge Gate and chain-level integration evidence remain outside the slice set.
 - **Rejected alternatives:** A final slice whose only purpose is “run all tests” or merge branches.
 - **Reason:** The task contract explicitly excludes chain-level evidence and the Merge Gate from requirement-to-slice ownership.
 
@@ -83,3 +83,9 @@
 - **Choice:** No slice introduces multi-turn/streaming workflows, multimodal input, private knowledge bases, automated high-compliance decisions, math/logic assurance, non-Python execution, extra providers, semantic cache reuse, source crawling, accounts/billing, online learning, report mutation/deletion, distributed jobs, or a new design system.
 - **Rejected alternatives:** Implement adjacent PRD future ideas while building extension points.
 - **Reason:** The full MVP is already broad; stable ports preserve future extensibility without diluting the specification of record.
+
+## 15. Separate observability/privacy from public abuse controls
+
+- **Choice:** Slice 14 owns lifecycle telemetry, secret redaction, and privacy-safe diagnostic surfaces; Slice 16 independently owns request bounds, rate/concurrency limits, model allow-lists, trusted-proxy behavior, outbound-URL policy, and bounded public errors. Both rely only on the tracer, and local delivery waits for both because its release checks exercise both.
+- **Rejected alternatives:** Keep the two operational deliverables bundled in one broad slice, or serialize public controls behind observability despite no implementation dependency.
+- **Reason:** The two concerns have distinct acceptance seams and can be demonstrated independently. Splitting them reduces implementation context without narrowing the post-tracer frontier or inventing a false dependency.
