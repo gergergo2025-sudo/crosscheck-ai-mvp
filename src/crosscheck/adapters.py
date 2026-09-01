@@ -10,9 +10,13 @@ objects deliberately do not cross the adapter boundary: callers only receive an
 from __future__ import annotations
 
 import json
+import asyncio
+import random
 import re
 import time
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from collections.abc import Awaitable, Callable
 from typing import Any, Mapping, Protocol
 
 import httpx
@@ -24,13 +28,57 @@ class AdapterError(RuntimeError):
     """Base error that is safe to convert into a provider status."""
 
     failure_class = "adapter_error"
+    retryable = False
+    status_code: int | None = None
+    retry_after: float | None = None
+
+    def __init__(
+        self,
+        message: str = "provider adapter failed",
+        *,
+        failure_class: str | None = None,
+        retryable: bool | None = None,
+        status_code: int | None = None,
+        retry_after: float | None = None,
+    ) -> None:
+        # Upstream exception messages can contain credentials or response bodies.
+        # Keep them available to a local diagnostic only; the query boundary never
+        # serializes ``str(exc)``.
+        super().__init__(message)
+        if failure_class is not None:
+            self.failure_class = failure_class
+        if retryable is not None:
+            self.retryable = retryable
+        if status_code is not None:
+            self.status_code = status_code
+        if retry_after is not None:
+            self.retry_after = retry_after
 
 
 class AdapterUnavailable(AdapterError):
     failure_class = "unavailable"
 
 
-class AdapterTransportError(AdapterError):
+class AdapterRetryableError(AdapterError):
+    """A transient provider failure which may be retried."""
+
+    failure_class = "retryable"
+    retryable = True
+
+
+class AdapterTimeoutError(AdapterRetryableError):
+    """The provider did not finish within the bounded attempt timeout."""
+
+    failure_class = "timeout"
+
+
+class AdapterPermanentError(AdapterError):
+    """A non-retryable provider failure such as authentication or bad input."""
+
+    failure_class = "permanent"
+
+
+class AdapterTransportError(AdapterRetryableError):
     """A network/HTTP failure with no upstream body exposed to callers."""
 
     failure_class = "transport_error"
@@ -51,9 +99,194 @@ class AdapterHTTPError(AdapterError):
 
     failure_class = "http_error"
 
-    def __init__(self, status_code: int) -> None:
-        self.status_code = int(status_code)
-        super().__init__(f"provider request failed with HTTP {self.status_code}")
+    def __init__(self, status_code: int, message: str = "provider HTTP failure", *, retry_after: float | None = None):
+        retryable = status_code == 408 or status_code == 429 or 500 <= status_code <= 599
+        super().__init__(
+            message,
+            failure_class="http_error",
+            retryable=retryable,
+            status_code=status_code,
+            retry_after=retry_after,
+        )
+
+
+class AdapterInvocationError(AdapterError):
+    """Sanitized terminal error returned by the retry runner.
+
+    ``retry_count`` is intentionally metadata rather than a public error message;
+    the HTTP report can show bounded retry information without echoing an upstream
+    exception or response body.
+    """
+
+    def __init__(
+        self,
+        failure_class: str,
+        *,
+        retry_count: int = 0,
+        provider: str = "unknown",
+        status_code: int | None = None,
+    ) -> None:
+        super().__init__(failure_class, failure_class=failure_class, retryable=False, status_code=status_code)
+        self.retry_count = retry_count
+        self.provider = provider
+
+
+@dataclass(frozen=True)
+class RetryPolicy:
+    """Bounded retry/deadline controls shared by every Model Adapter."""
+
+    attempt_timeout_seconds: float = 10.0
+    max_retries: int = 2
+    backoff_base_seconds: float = 0.25
+    backoff_max_seconds: float = 5.0
+    jitter_seconds: float = 0.25
+    retry_after_max_seconds: float = 5.0
+
+    def __post_init__(self) -> None:
+        if self.attempt_timeout_seconds <= 0:
+            raise ValueError("attempt timeout must be positive")
+        if self.max_retries < 0:
+            raise ValueError("max retries cannot be negative")
+        if self.backoff_base_seconds < 0 or self.backoff_max_seconds < 0:
+            raise ValueError("backoff values cannot be negative")
+        if self.jitter_seconds < 0 or self.retry_after_max_seconds < 0:
+            raise ValueError("jitter and retry-after bounds cannot be negative")
+
+
+def _retryable_exception(exc: BaseException) -> bool:
+    """Classify transport failures without exposing provider-specific types."""
+
+    if isinstance(exc, AdapterUnavailable | AdapterPermanentError | AdapterInvocationError):
+        return False
+    if isinstance(exc, (AdapterRetryableError, AdapterTimeoutError, TimeoutError, asyncio.TimeoutError)):
+        return True
+    if bool(getattr(exc, "retryable", False)):
+        return True
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
+    if isinstance(status, int):
+        return status == 408 or status == 429 or 500 <= status <= 599
+    # ``httpx`` is optional at this module boundary, so classify its transport
+    # hierarchy by name rather than importing an SDK/type at import time.
+    name = type(exc).__name__.lower()
+    return any(token in name for token in ("timeout", "connecterror", "networkerror", "readerror", "writeerror"))
+
+
+def _retry_after_seconds(exc: BaseException, policy: RetryPolicy) -> float | None:
+    value = getattr(exc, "retry_after", None)
+    if value is None:
+        response = getattr(exc, "response", None)
+        headers = getattr(response, "headers", None)
+        if headers:
+            value = headers.get("retry-after") or headers.get("Retry-After")
+    try:
+        if value is None:
+            return None
+        # Date-form Retry-After is intentionally ignored: a bounded numeric value
+        # is deterministic and prevents clock-skew-induced long sleeps.
+        return max(0.0, min(float(value), policy.retry_after_max_seconds))
+    except (TypeError, ValueError):
+        return None
+
+
+def _backoff_seconds(retry_index: int, exc: BaseException, policy: RetryPolicy, random_fn: Callable[[], float]) -> float:
+    """Return bounded exponential backoff with additive jitter."""
+
+    retry_after = _retry_after_seconds(exc, policy)
+    exponential = min(policy.backoff_max_seconds, policy.backoff_base_seconds * (2**max(0, retry_index - 1)))
+    # Jitter is deliberately bounded and deterministic under an injected random
+    # function. Retry-After is a lower bound, never an avenue to exceed our cap.
+    jitter = policy.jitter_seconds * max(0.0, min(1.0, random_fn()))
+    return min(policy.backoff_max_seconds, max(exponential + jitter, retry_after or 0.0))
+
+
+async def call_with_retries(
+    adapter: ModelAdapter,
+    prompt: str,
+    *,
+    model: str,
+    deadline: float,
+    policy: RetryPolicy | None = None,
+    clock: Callable[[], float] = time.monotonic,
+    sleeper: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    random_fn: Callable[[], float] = random.random,
+) -> AdapterResult:
+    """Call one Adapter under an absolute deadline and bounded retries.
+
+    The caller owns sibling isolation and may run this coroutine concurrently with
+    other models. This function never retries permanent failures and never sleeps
+    past the query deadline.
+    """
+
+    policy = policy or RetryPolicy()
+    retry_count = 0
+    provider = getattr(adapter, "provider", "unknown")
+    while True:
+        remaining = deadline - clock()
+        if remaining <= 0:
+            raise AdapterInvocationError("deadline", retry_count=retry_count, provider=provider)
+        timeout = min(policy.attempt_timeout_seconds, remaining)
+        try:
+            value = await asyncio.wait_for(
+                adapter.generate(prompt, model=model, deadline=deadline),
+                timeout=timeout,
+            )
+            if isinstance(value, AdapterResult):
+                result = value
+            elif isinstance(value, str):
+                result = AdapterResult(raw_text=value, provider=provider, model=model)
+            else:
+                result = AdapterResult.model_validate({"model": model, **dict(value)})
+            # Adapters may represent HTTP failures as a result to keep SDK details
+            # outside this boundary. Only explicit transient statuses are retried.
+            status = str(result.status or "ok").casefold()
+            failure_class = str(result.failure_class or "").casefold()
+            if status in {"retryable", "timeout", "temporarily_unavailable", "rate_limited", "408", "429", "5xx"} or failure_class in {
+                "retryable",
+                "timeout",
+                "rate_limited",
+                "temporarily_unavailable",
+                "http_retryable",
+            }:
+                exc: BaseException = AdapterRetryableError(status, retry_after=None)
+                if retry_count >= policy.max_retries:
+                    raise AdapterInvocationError(
+                        result.failure_class or status,
+                        retry_count=retry_count,
+                        provider=result.provider or provider,
+                    )
+                retry_count += 1
+                delay = _backoff_seconds(retry_count, exc, policy, random_fn)
+                remaining = deadline - clock()
+                if remaining <= 0:
+                    raise AdapterInvocationError("deadline", retry_count=retry_count, provider=provider)
+                await sleeper(min(delay, remaining))
+                continue
+            result.retry_count = retry_count
+            return result
+        except asyncio.CancelledError:
+            raise
+        except AdapterInvocationError:
+            raise
+        except BaseException as exc:
+            if not _retryable_exception(exc) or retry_count >= policy.max_retries:
+                failure_class = getattr(exc, "failure_class", None)
+                if not failure_class:
+                    failure_class = "timeout" if isinstance(exc, (TimeoutError, asyncio.TimeoutError)) else "provider_error"
+                raise AdapterInvocationError(
+                    str(failure_class),
+                    retry_count=retry_count,
+                    provider=provider,
+                    status_code=getattr(exc, "status_code", None),
+                ) from exc
+            retry_count += 1
+            delay = _backoff_seconds(retry_count, exc, policy, random_fn)
+            remaining = deadline - clock()
+            if remaining <= 0:
+                raise AdapterInvocationError("deadline", retry_count=retry_count, provider=provider) from exc
+            await sleeper(min(delay, remaining))
 
 
 class ModelAdapter(Protocol):

@@ -21,6 +21,25 @@ class RequestValidationError(CrossCheckError):
     safe_message = "The request is invalid."
 
 
+class RateLimitExceeded(CrossCheckError):
+    """Anonymous client exceeded the configured request budget."""
+
+    status_code = 429
+    code = "RATE_LIMIT_EXCEEDED"
+    safe_message = "Too many requests. Please retry later."
+
+    def __init__(self, message: str | None = None, *, retry_after: int | None = None, details: Any | None = None) -> None:
+        super().__init__(message, details=details)
+        self.retry_after = retry_after
+
+
+class ConcurrencyLimitExceeded(RateLimitExceeded):
+    """No query worker is immediately available; work is rejected, not queued."""
+
+    code = "CONCURRENCY_LIMIT_EXCEEDED"
+    safe_message = "Too many queries are running. Please retry later."
+
+
 class ModelConfigurationUnavailable(CrossCheckError):
     status_code = 503
     code = "MODEL_CONFIGURATION_UNAVAILABLE"
