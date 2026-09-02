@@ -11,11 +11,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from .adapters import AdapterRegistry, default_adapter_registry
-from .cache import ReportCache
+from .cache import NullReportCache, RedisReportCache, ReportCache
 from .classification import Classifier
-from .clustering import ClaimClusterer
+from .clustering import ClaimClusterer, OpenAIEmbeddingService, SemanticClaimClusterer
 from .config import Settings, get_settings
-from .constraints import ConstraintService
+from .constraints import ConstraintService, IndependentConstraintService
 from .contracts import (
     ErrorDetail,
     ErrorResponse,
@@ -35,8 +35,8 @@ from .errors import (
 from .limits import NonBlockingConcurrency, SlidingWindowRateLimiter, client_identity
 from .persistence import Database, PersistenceError, ReportStore
 from .query import QueryService
-from .scoring import Scorer
-from .telemetry import Telemetry
+from .scoring import EvidenceScorer, Scorer
+from .telemetry import StructuredTelemetry, Telemetry
 from .verifier_registry import default_verifier_registry
 from .verifiers import VerifierRegistry
 
@@ -116,6 +116,13 @@ def create_app(
         resolved_settings.configured_models(), settings=resolved_settings
     )
     resolved_verifiers = verifiers or default_verifier_registry(resolved_settings)
+    if clusterer is None:
+        embedder = OpenAIEmbeddingService(resolved_settings.openai_api_key, resolved_settings.openai_base_url, resolved_settings.embedding_model) if resolved_settings.openai_api_key else None
+        clusterer = SemanticClaimClusterer(embedder, threshold=resolved_settings.clustering_threshold, lexical_threshold=resolved_settings.lexical_clustering_threshold)
+    scorer = scorer or EvidenceScorer()
+    constraint_service = constraint_service or IndependentConstraintService()
+    telemetry = telemetry or StructuredTelemetry()
+    cache = cache or (RedisReportCache(resolved_settings.redis_url, store=resolved_store, ttl_seconds=resolved_settings.cache_ttl_seconds, lock_seconds=resolved_settings.cache_lock_seconds) if resolved_settings.redis_url else NullReportCache())
     rate_limiter = SlidingWindowRateLimiter(
         resolved_settings.rate_limit_requests,
         resolved_settings.rate_limit_window_seconds,
@@ -187,18 +194,24 @@ def create_app(
                     message="request body is too large",
                     request_id=request.state.request_id,
                 )
-        # Content-Length is absent or untrusted for chunked requests.  Reading and
-        # caching the bounded body closes that gap while preserving FastAPI's body
-        # parser for the endpoint.
+        # Buffer at most the configured bound and abort while receiving the first
+        # chunk that crosses it. Replaying the bounded bytes preserves FastAPI's
+        # normal body parser without materializing an unbounded chunked upload.
         if request.method in {"POST", "PUT", "PATCH"}:
-            body = await request.body()
-            if len(body) > resolved_settings.max_body_bytes:
-                return _error_response(
-                    status_code=422,
-                    code="VALIDATION_ERROR",
-                    message="request body is too large",
-                    request_id=request.state.request_id,
-                )
+            body = bytearray()
+            async for chunk in request.stream():
+                body.extend(chunk)
+                if len(body) > resolved_settings.max_body_bytes:
+                    return _error_response(status_code=422, code="VALIDATION_ERROR", message="request body is too large", request_id=request.state.request_id)
+            request._body = bytes(body)
+            replayed = False
+            async def bounded_receive():
+                nonlocal replayed
+                if replayed:
+                    return {"type": "http.request", "body": b"", "more_body": False}
+                replayed = True
+                return {"type": "http.request", "body": bytes(body), "more_body": False}
+            request._receive = bounded_receive
         return await call_next(request)
 
     @application.exception_handler(FastAPIRequestValidationError)
@@ -293,12 +306,17 @@ def create_app(
                 details={"suggested_answer": ["maximum length exceeded"]},
             )
         try:
-            return await store.create_feedback(payload)
+            result = await store.create_feedback(payload)
+            request.app.state.runtime.query_service.telemetry.emit("feedback.created", report_id=str(payload.report_id), feedback_id=str(result.feedback_id), outcome="stored")
+            return result
         except PersistenceError as exc:
             if str(exc) == "report not found":
+                request.app.state.runtime.query_service.telemetry.emit("feedback.created", report_id=str(payload.report_id), outcome="invalid_report")
                 raise FeedbackTargetNotFound() from exc
             if str(exc) == "claim does not belong to report":
+                request.app.state.runtime.query_service.telemetry.emit("feedback.created", report_id=str(payload.report_id), outcome="invalid_claim")
                 raise FeedbackClaimNotFound() from exc
+            request.app.state.runtime.query_service.telemetry.emit("feedback.created", report_id=str(payload.report_id), outcome="persistence_error")
             raise CrossCheckError() from exc
 
     return application

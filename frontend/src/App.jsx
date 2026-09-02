@@ -38,7 +38,7 @@ function ParseBadge({ status }) {
 function ModelCard({ answer, defaultOpen = false }) {
   const [open, setOpen] = useState(defaultOpen);
   return (
-    <details className="model-card" open={open} onToggle={(event) => setOpen(event.currentTarget.open)}>
+    <details className="model-card" id={`answer-${answer.id}`} open={open} onToggle={(event) => setOpen(event.currentTarget.open)}>
       <summary>
         <span className="model-title">
           <strong>{answer.model}</strong>
@@ -68,6 +68,7 @@ function ModelCard({ answer, defaultOpen = false }) {
             {answer.claims.map((claim) => (
               <li key={claim.id || claim.claim}>
                 <StatusBadge status={claim.verification_status} /> {claim.claim}
+                {claim.evidence_ids?.map((id) => <a className="evidence-ref" href={`#evidence-${id}`} key={id}>evidence</a>)}
               </li>
             ))}
             </ul>
@@ -75,9 +76,58 @@ function ModelCard({ answer, defaultOpen = false }) {
         {answer.parse_diagnostics?.length ? (
           <p className="parse-diagnostics muted">{answer.parse_diagnostics.join(" ")}</p>
         ) : null}
+        {answer.score_components && Object.keys(answer.score_components).length ? (
+          <div className="score-breakdown">
+            <strong>Score breakdown</strong>
+            <dl>{Object.entries(answer.score_components).map(([name, component]) => (
+              <div key={name}><dt>{name}</dt><dd>{component?.score == null ? component?.reason : Number(component.score).toFixed(2)}</dd></div>
+            ))}</dl>
+          </div>
+        ) : null}
       </div>
     </details>
   );
+}
+
+function FeedbackForm({ report }) {
+  const claims = report.model_comparison?.flatMap((answer) => answer.claims || []) || [];
+  const [helpful, setHelpful] = useState(null);
+  const [claimId, setClaimId] = useState("");
+  const [comment, setComment] = useState("");
+  const [suggestedAnswer, setSuggestedAnswer] = useState("");
+  const [state, setState] = useState({ loading: false, message: "", error: false });
+
+  async function submitFeedback(event) {
+    event.preventDefault();
+    if (helpful == null || state.loading) return;
+    setState({ loading: true, message: "", error: false });
+    const body = { report_id: report.report_id, helpful };
+    if (claimId) body.claim_id = claimId;
+    if (comment.trim()) body.comment = comment;
+    if (suggestedAnswer.trim()) body.suggested_answer = suggestedAnswer;
+    try {
+      const response = await fetch(`${API_BASE}/api/feedback`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload?.error?.message || "Feedback could not be saved.");
+      setState({ loading: false, message: "Feedback saved.", error: false });
+    } catch (cause) {
+      setState({ loading: false, message: cause instanceof Error ? cause.message : "Feedback could not be saved.", error: true });
+    }
+  }
+
+  return <form className="feedback-form" onSubmit={submitFeedback} aria-labelledby="feedback-heading">
+    <h3 id="feedback-heading">Feedback</h3>
+    <fieldset><legend>Was this report helpful?</legend>
+      <label><input type="radio" name="helpful" aria-label="Helpful" checked={helpful === true} onChange={() => setHelpful(true)} /> Helpful</label>
+      <label><input type="radio" name="helpful" aria-label="Not helpful" checked={helpful === false} onChange={() => setHelpful(false)} /> Not helpful</label>
+    </fieldset>
+    <label htmlFor="error-claim">Erroneous claim <span className="muted">(optional)</span></label>
+    <select id="error-claim" value={claimId} onChange={(event) => setClaimId(event.target.value)}><option value="">None selected</option>{claims.map((claim) => <option value={claim.id} key={claim.id}>{claim.claim}</option>)}</select>
+    <label htmlFor="feedback-comment">Comment</label><textarea id="feedback-comment" aria-label="Comment" value={comment} maxLength={5000} onChange={(event) => setComment(event.target.value)} />
+    <label htmlFor="suggested-answer">Suggested answer</label><textarea id="suggested-answer" value={suggestedAnswer} maxLength={20000} onChange={(event) => setSuggestedAnswer(event.target.value)} />
+    <button type="submit" disabled={helpful == null || state.loading}>{state.loading ? "Saving…" : "Submit feedback"}</button>
+    {state.message ? <p role={state.error ? "alert" : "status"}>{state.message}</p> : null}
+  </form>;
 }
 
 function Report({ report }) {
@@ -96,11 +146,11 @@ function Report({ report }) {
       </p>
 
       <article className="recommendation" aria-labelledby="recommendation-heading">
-        <p className="eyebrow">Recommendation</p>
+        <p className="eyebrow">{report.evidence_only ? "Evidence summary" : "Recommendation"}</p>
         <h3 id="recommendation-heading">
-          {report.recommended_answer ? `Answer from ${report.recommended_answer.model}` : "No automated recommendation"}
+          {report.evidence_only ? "Decision endorsement suppressed" : report.recommended_answer ? `Answer from ${report.recommended_answer.model}` : "No automated recommendation"}
         </h3>
-        {report.recommended_answer ? <p>{report.recommended_answer.answer}</p> : <p>{report.recommendation_message}</p>}
+        {!report.evidence_only && report.recommended_answer ? <p>{report.recommended_answer.answer}</p> : <p>{report.recommendation_message}</p>}
       </article>
 
       {report.warnings?.length ? (
@@ -110,20 +160,23 @@ function Report({ report }) {
         </aside>
       ) : null}
 
-      <section className="report-section" aria-labelledby="models-heading">
-        <h3 id="models-heading">Model answers</h3>
-        <div className="comparison-grid" aria-label="Model comparison">
-          {report.model_comparison?.map((answer, index) => <ModelCard answer={answer} defaultOpen={index === 0} key={answer.id || answer.model} />)}
-        </div>
+      <div className="report-layout"><div className="assurance-column">
+      <section className="report-section" aria-labelledby="consensus-heading"><h3 id="consensus-heading">Consensus</h3>
+        {report.consensus?.length ? <ul>{report.consensus.map((item) => <li key={item.cluster_id}><StatusBadge status="verified" /> {item.claim_text}<span className="muted"> — {item.support_models?.join(", ")}</span></li>)}</ul> : <p className="muted">No independently verified multi-provider consensus.</p>}
       </section>
-
+      <section className="report-section" aria-labelledby="disagreements-heading"><h3 id="disagreements-heading">Disagreements</h3>
+        {report.disagreements?.length ? <ul>{report.disagreements.map((item, index) => <li key={item.cluster_id || index}>{item.claim_text} <span className="muted">— {item.reason}</span>{item.answer_ids?.map((id) => <a className="answer-ref" href={`#answer-${id}`} key={id}>view answer</a>)}</li>)}</ul> : <p className="muted">No disagreement items.</p>}
+      </section>
+      <section className="report-section" aria-labelledby="constraints-heading"><h3 id="constraints-heading">Constraint checks</h3>
+        {Object.keys(report.constraints_check || {}).length ? <dl className="constraint-list">{Object.entries(report.constraints_check).map(([name, check]) => <div key={name}><dt>{name}</dt><dd><StatusBadge status={check.status === "satisfied" ? "verified" : check.status === "violated" ? "conflict" : "unverified"} /> {check.reason}</dd></div>)}</dl> : <p className="muted">No submitted constraints.</p>}
+      </section>
       <section className="report-section" aria-labelledby="evidence-heading">
         <h3 id="evidence-heading">Evidence</h3>
         {evidence.length ? (
           <ul className="evidence-list">
             {evidence.map((item, index) => {
               const url = safeHttpUrl(item.url);
-              return <li key={item.id || `${item.url}-${index}`}>
+              return <li id={item.id ? `evidence-${item.id}` : undefined} key={item.id || `${item.url}-${index}`}>
                 {url ? <a href={url.href} target="_blank" rel="noreferrer noopener">{url.hostname}</a> : <span className="muted">Source unavailable</span>}
                 {item.title ? <span> — {item.title}</span> : null}
               </li>;
@@ -131,6 +184,12 @@ function Report({ report }) {
           </ul>
         ) : <p className="muted">No independent evidence was attached in this tracer report.</p>}
       </section>
+      </div><aside className="model-column"><section className="report-section" aria-labelledby="models-heading">
+        <h3 id="models-heading">Model answers</h3>
+        <div className="comparison-grid" aria-label="Model comparison">{report.model_comparison?.map((answer, index) => <ModelCard answer={answer} defaultOpen={index === 0} key={answer.id || answer.model} />)}</div>
+      </section></aside></div>
+
+      <FeedbackForm report={report} />
 
       <p className="notice disclaimer" role="note">AI-generated content may be wrong; verify important information.</p>
     </section>

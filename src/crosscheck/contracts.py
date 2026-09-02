@@ -112,6 +112,7 @@ class Claim(FlexibleResponseModel):
     verification_status: VerificationStatus = "pending"
     verification_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
     evidence_ids: list[UUID] = Field(default_factory=list)
+    verification_ids: list[UUID] = Field(default_factory=list)
 
     @field_validator("claim")
     @classmethod
@@ -229,6 +230,9 @@ class ReportResponse(FlexibleResponseModel):
     evidence: list[dict[str, Any]] = Field(default_factory=list)
     constraints_check: dict[str, Any] = Field(default_factory=dict)
     warnings: list[str] = Field(default_factory=list)
+    behavior_versions: dict[str, Any] = Field(default_factory=dict)
+    cache_key_version: str | None = None
+    evidence_only: bool = False
 
 
 class ErrorDetail(FlexibleResponseModel):

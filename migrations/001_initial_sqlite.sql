@@ -68,6 +68,7 @@ CREATE TABLE IF NOT EXISTS claims (
     verification_status TEXT NOT NULL CHECK (verification_status IN ('pending', 'verified', 'unverified', 'conflict', 'unavailable', 'not_applicable')),
     verification_confidence REAL CHECK (verification_confidence >= 0 AND verification_confidence <= 1),
     evidence_ids JSON NOT NULL,
+    verification_ids JSON NOT NULL DEFAULT '[]',
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_claims_answer_id ON claims(answer_id);
@@ -105,6 +106,7 @@ CREATE TABLE IF NOT EXISTS reports (
     cache_key TEXT,
     cache_key_version TEXT,
     report_payload JSON,
+    behavior_versions JSON NOT NULL DEFAULT '{}',
     total_duration_ms REAL NOT NULL,
     created_at TEXT NOT NULL,
     UNIQUE(question_id)

@@ -86,21 +86,26 @@ class Database:
                     # visible to subsequent transactions in test fixtures.
                     kwargs["poolclass"] = StaticPool
             self.engine = create_async_engine(self.url, **kwargs)
-        if not self.migrated:
+        # SQLite is a disposable test/development seam. Production PostgreSQL
+        # schema changes are deployment-owned and run only through migrate.py.
+        if _is_sqlite(self.url) and not self.migrated:
             await self.migrate()
 
     async def migrate(self) -> None:
         if self.engine is None:
             raise PersistenceError("database engine is not initialized")
-        migration_name = "001_initial_sqlite.sql" if _is_sqlite(self.url) else "001_initial.sql"
-        migration_path = Path(__file__).resolve().parents[2] / "migrations" / migration_name
-        if not migration_path.exists():
-            raise PersistenceError(f"migration file is missing: {migration_name}")
-        script = migration_path.read_text(encoding="utf-8")
-        statements = [part.strip() for part in re.split(r";\s*(?:\n|$)", script) if part.strip()]
+        migrations_dir = Path(__file__).resolve().parents[2] / "migrations"
+        migration_paths = [migrations_dir / "001_initial_sqlite.sql"] if _is_sqlite(self.url) else [
+            path for path in sorted(migrations_dir.glob("[0-9][0-9][0-9]_*.sql")) if "_sqlite" not in path.stem
+        ]
+        if not migration_paths:
+            raise PersistenceError("migration files are missing")
         async with self.engine.begin() as connection:
-            for statement in statements:
-                await connection.execute(text(statement))
+            for migration_path in migration_paths:
+                script = migration_path.read_text(encoding="utf-8")
+                statements = [part.strip() for part in re.split(r";\s*(?:\n|$)", script) if part.strip()]
+                for statement in statements:
+                    await connection.execute(text(statement))
         self.migrated = True
 
     @asynccontextmanager
@@ -259,12 +264,13 @@ class ReportStore:
                                 (id, answer_id, claim_text, normalized_text, claim_type,
                                  source, self_confidence, assumptions, cluster_id,
                                  verification_status, verification_confidence,
-                                 evidence_ids, created_at)
+                                 evidence_ids, verification_ids, created_at)
                                 VALUES (:id, :answer_id, :claim_text, :normalized_text,
                                  :claim_type, :source, :self_confidence, :assumptions,
                                  :cluster_id, :verification_status,
-                                 :verification_confidence, :evidence_ids, :created_at)""",
-                                {"evidence_ids"},
+                                 :verification_confidence, :evidence_ids,
+                                 :verification_ids, :created_at)""",
+                                {"evidence_ids", "verification_ids"},
                             ),
                             {
                                 "id": str(claim.id),
@@ -279,6 +285,7 @@ class ReportStore:
                                 "verification_status": claim.verification_status,
                                 "verification_confidence": claim.verification_confidence,
                                 "evidence_ids": [str(item) for item in claim.evidence_ids],
+                                "verification_ids": [str(item) for item in claim.verification_ids],
                                 "created_at": created_at,
                             },
                         )
@@ -320,12 +327,12 @@ class ReportStore:
                          recommendation_message, consensus, disagreements,
                          model_scores, constraints_check, evidence, warnings,
                          prompt_version, cache_key, cache_key_version,
-                         report_payload, total_duration_ms, created_at)
+                         report_payload, behavior_versions, total_duration_ms, created_at)
                         VALUES (:id, :question_id, :recommended_answer_id, :status,
                          :recommendation_message, :consensus, :disagreements,
                          :model_scores, :constraints_check, :evidence, :warnings,
                          :prompt_version, :cache_key, :cache_key_version,
-                         :report_payload, :total_duration_ms, :created_at)""",
+                         :report_payload, :behavior_versions, :total_duration_ms, :created_at)""",
                         {
                             "consensus",
                             "disagreements",
@@ -334,6 +341,7 @@ class ReportStore:
                             "evidence",
                             "warnings",
                             "report_payload",
+                            "behavior_versions",
                         },
                     ),
                     {
@@ -353,7 +361,7 @@ class ReportStore:
                         "constraints_check": report.constraints_check,
                         "evidence": report.evidence,
                         "warnings": report.warnings,
-                        "prompt_version": "unified-v1",
+                        "prompt_version": report.behavior_versions.get("prompt", "unknown"),
                         "cache_key": cache_key,
                         "cache_key_version": cache_key_version,
                         # Keep a validated, immutable response snapshot so a
@@ -365,6 +373,7 @@ class ReportStore:
                             "cache_key": cache_key,
                             "cache_key_version": cache_key_version,
                         },
+                        "behavior_versions": report.behavior_versions,
                         "total_duration_ms": report.duration_ms,
                         "created_at": created_at,
                     },

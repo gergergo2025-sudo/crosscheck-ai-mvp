@@ -1,8 +1,9 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import App from "./App.jsx";
+import { axe } from "vitest-axe";
 
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 
 const report = {
   report_id: "report-1",
@@ -16,6 +17,7 @@ const report = {
   consensus: [],
   disagreements: [],
   warnings: [],
+  constraints_check: {},
 };
 
 const comparisonReport = {
@@ -85,5 +87,49 @@ describe("single-turn question form", () => {
     expect(screen.getByText(/2 retries/)).toBeInTheDocument();
     expect(screen.queryByRole("link", { name: /javascript/i })).not.toBeInTheDocument();
     expect(screen.getByRole("link", { name: "example.com" })).toHaveAttribute("rel", "noreferrer noopener");
+  });
+
+  it("renders assurance sections and submits feedback without discarding typed values", async () => {
+    const assurance = {
+      ...report,
+      consensus: [{ cluster_id: "c1", claim_text: "Verified fact", support_models: ["m1", "m2"], evidence_ids: ["e1"] }],
+      disagreements: [{ cluster_id: "c2", claim_text: "Uncertain fact", reason: "singleton claim", answer_ids: ["answer-1"] }],
+      constraints_check: { budget: { status: "satisfied", reason: "within budget" } },
+      model_comparison: [{ ...report.model_comparison[0], score_components: { fact_verification: { score: 1, weight: .3 } }, claims: [{ id: "claim-1", claim: "Verified fact", verification_status: "verified", evidence_ids: ["e1"] }] }],
+      evidence: [{ id: "e1", url: "https://example.com", title: "Evidence" }],
+    };
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce({ ok: true, json: async () => assurance })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ feedback_id: "f1" }) });
+    render(<App />);
+    fireEvent.change(screen.getByLabelText("Question"), { target: { value: "Who?" } });
+    fireEvent.submit(screen.getByLabelText("Question").closest("form"));
+    await waitFor(() => expect(screen.getByRole("heading", { name: "Consensus" })).toBeInTheDocument());
+    expect(screen.getByRole("heading", { name: "Disagreements" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Constraint checks" })).toBeInTheDocument();
+    expect(screen.getByText("fact_verification")).toBeInTheDocument();
+    fireEvent.click(screen.getByLabelText("Helpful"));
+    fireEvent.change(screen.getByLabelText("Comment"), { target: { value: "Useful" } });
+    fireEvent.click(screen.getByRole("button", { name: "Submit feedback" }));
+    await waitFor(() => expect(screen.getByText("Feedback saved.")).toBeInTheDocument());
+    expect(fetchMock).toHaveBeenLastCalledWith(expect.stringContaining("/api/feedback"), expect.any(Object));
+  });
+
+  it("uses evidence-only language for high-compliance reports", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue({ ok: true, json: async () => ({ ...report, evidence_only: true, recommended_answer: { ...report.model_comparison[0] } }) });
+    render(<App />);
+    fireEvent.change(screen.getByLabelText("Question"), { target: { value: "medical advice" } });
+    fireEvent.submit(screen.getByLabelText("Question").closest("form"));
+    await waitFor(() => expect(screen.getByText("Evidence summary", { selector: ".eyebrow" })).toBeInTheDocument());
+    expect(screen.queryByText("Recommendation", { selector: ".eyebrow" })).not.toBeInTheDocument();
+  });
+
+  it("has no automated accessibility violations in the complete report flow", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue({ ok: true, json: async () => report });
+    const { container } = render(<App />);
+    fireEvent.change(screen.getByLabelText("Question"), { target: { value: "Accessible report" } });
+    fireEvent.submit(screen.getByLabelText("Question").closest("form"));
+    await waitFor(() => expect(screen.getByRole("heading", { name: "Cross-check results" })).toBeInTheDocument());
+    expect(await axe(container)).toHaveNoViolations();
   });
 });

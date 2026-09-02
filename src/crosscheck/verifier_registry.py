@@ -9,11 +9,14 @@ deterministic verifier, which reports uncertainty instead of a pass.
 from __future__ import annotations
 
 from .config import Settings
-from .verifiers import VerifierRegistry
+from .verifiers import CodeVerifier, FactVerifier, VerifierRegistry
 
 
 def default_verifier_registry(settings: Settings) -> VerifierRegistry:
     """Build the configured Verifier registry without contacting any service."""
 
     registry = VerifierRegistry()
+    if settings.tavily_api_key:
+        registry.register("fact", FactVerifier(settings.tavily_api_key, max_results=settings.tavily_max_results))
+    registry.register("code", CodeVerifier(settings.sandbox_image, timeout_seconds=settings.sandbox_timeout_seconds))
     return registry

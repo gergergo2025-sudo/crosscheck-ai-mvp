@@ -445,7 +445,12 @@ class OpenAICompatibleAdapter(BaseModelAdapter):
 
     def _parse_response(self, response: httpx.Response, *, model: str) -> tuple[str, dict[str, Any] | None, float | None]:
         if response.status_code < 200 or response.status_code >= 300:
-            raise AdapterHTTPError(response.status_code)
+            try:
+                raw_retry_after = response.headers.get("retry-after")
+                retry_after = float(raw_retry_after) if raw_retry_after is not None else None
+            except (TypeError, ValueError):
+                retry_after = None
+            raise AdapterHTTPError(response.status_code, retry_after=retry_after)
         try:
             body = response.json()
         except (ValueError, TypeError) as exc:
@@ -562,10 +567,73 @@ class DeepSeekAdapter(OpenAICompatibleAdapter):
     default_model = "deepseek-chat"
 
 
+class AnthropicAdapter(BaseModelAdapter):
+    """Provider-neutral adapter for Anthropic's Messages API."""
+
+    provider = "anthropic"
+    default_base_url = "https://api.anthropic.com"
+    default_model = "claude-3-5-sonnet-latest"
+
+    def __init__(self, api_key: str | None = None, base_url: str | None = None, *, model: str | None = None,
+                 public_model: str | None = None, timeout: float = 10.0,
+                 http_client: httpx.AsyncClient | None = None, max_response_chars: int = 120_000) -> None:
+        self.api_key = api_key.strip() if api_key and api_key.strip() else None
+        self.base_url = (base_url or self.default_base_url).rstrip("/")
+        self.configured_model = (model or self.default_model).strip()
+        self.public_model = (public_model or "").strip()
+        self.timeout = timeout
+        self.http_client = http_client
+        self.max_response_chars = min(max(1, max_response_chars), 120_000)
+
+    async def generate(self, prompt: str, *, model: str | None = None, deadline: float | None = None, **options: Any) -> AdapterResult:
+        if not self.api_key:
+            raise AdapterUnavailable("anthropic provider is not configured")
+        effective = model if model and model not in {"anthropic", self.public_model} else self.configured_model
+        timeout = self.timeout if deadline is None else min(self.timeout, max(0.001, deadline - time.monotonic()))
+        payload = {"model": effective, "max_tokens": int(options.get("max_tokens", 4096)), "messages": [{"role": "user", "content": prompt}]}
+        client = self.http_client or httpx.AsyncClient()
+        owned = self.http_client is None
+        started = time.perf_counter()
+        try:
+            try:
+                response = await client.post(
+                    f"{self.base_url}/v1/messages",
+                    headers={"content-type": "application/json", "x-api-key": self.api_key, "anthropic-version": "2023-06-01"},
+                    json=payload, timeout=timeout,
+                )
+            except (httpx.TimeoutException, httpx.NetworkError, httpx.ProtocolError) as exc:
+                raise AdapterTransportError("provider request could not be completed") from exc
+        finally:
+            if owned:
+                await client.aclose()
+        if not 200 <= response.status_code < 300:
+            try:
+                retry_after = float(response.headers["retry-after"]) if "retry-after" in response.headers else None
+            except ValueError:
+                retry_after = None
+            raise AdapterHTTPError(response.status_code, retry_after=retry_after)
+        try:
+            body = response.json()
+            raw = "".join(str(item.get("text", "")) for item in body.get("content", []) if isinstance(item, Mapping) and item.get("type") == "text")
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise AdapterProtocolError("provider returned malformed JSON") from exc
+        if not raw:
+            raise AdapterProtocolError("provider response did not include message content")
+        raw = raw.replace(self.api_key, "[REDACTED]")[: self.max_response_chars]
+        usage = body.get("usage") if isinstance(body, Mapping) else None
+        token_usage = None
+        if isinstance(usage, Mapping):
+            input_tokens = int(usage.get("input_tokens", 0) or 0)
+            output_tokens = int(usage.get("output_tokens", 0) or 0)
+            token_usage = {"input_tokens": input_tokens, "output_tokens": output_tokens, "total_tokens": input_tokens + output_tokens}
+        return AdapterResult(raw_text=raw, provider=self.provider, model=effective, latency_ms=(time.perf_counter() - started) * 1000, token_usage=token_usage)
+
+
 # Readable compatibility aliases for callers that name adapters after their
 # provider rather than the shorter ``*Adapter`` form.
 OpenAIModelAdapter = OpenAIAdapter
 DeepSeekModelAdapter = DeepSeekAdapter
+AnthropicModelAdapter = AnthropicAdapter
 
 
 class DeterministicAdapter:
@@ -663,6 +731,13 @@ class AdapterRegistry:
         except KeyError as exc:
             raise AdapterUnavailable(f"model '{model}' is not configured") from exc
 
+    @property
+    def configuration_version(self) -> str:
+        return "adapter-v2|" + "|".join(
+            f"{name}:{getattr(adapter, 'provider', 'unknown')}:{getattr(adapter, 'configured_model', name)}"
+            for name, adapter in sorted(self._adapters.items())
+        )
+
 
 def _production_model_config(model: str) -> tuple[str, str] | None:
     """Resolve a configured model identifier to ``(provider, wire model)``.
@@ -678,16 +753,20 @@ def _production_model_config(model: str) -> tuple[str, str] | None:
     if ":" in value:
         prefix, concrete = value.split(":", 1)
         concrete = concrete.strip()
-        if prefix.casefold() in {"openai", "deepseek"} and concrete:
-            return prefix.casefold(), concrete
+        if prefix.casefold() in {"openai", "anthropic", "claude", "deepseek"} and concrete:
+            return ("anthropic" if prefix.casefold() == "claude" else prefix.casefold()), concrete
     if lowered in {"openai", "openai-default", "gpt", "gpt-default"}:
         return "openai", OpenAIAdapter.default_model
     if lowered in {"deepseek", "deepseek-default"}:
         return "deepseek", DeepSeekAdapter.default_model
+    if lowered in {"anthropic", "claude", "claude-default"}:
+        return "anthropic", AnthropicAdapter.default_model
     if lowered.startswith(("gpt-", "o1-", "o3-", "o4-")):
         return "openai", value
     if lowered.startswith("deepseek-"):
         return "deepseek", value
+    if lowered.startswith("claude-"):
+        return "anthropic", value
     return None
 
 
@@ -714,7 +793,7 @@ def default_adapter_registry(models: list[str], settings: Any | None = None) -> 
                 model=concrete_model,
                 public_model=model,
             ) if api_key else UnavailableAdapter(model=model, reason="openai provider is not configured")
-        else:
+        elif provider == "deepseek":
             api_key = getattr(settings, "deepseek_api_key", None)
             base_url = getattr(settings, "deepseek_base_url", None)
             adapter = DeepSeekAdapter(
@@ -723,6 +802,10 @@ def default_adapter_registry(models: list[str], settings: Any | None = None) -> 
                 model=concrete_model,
                 public_model=model,
             ) if api_key else UnavailableAdapter(model=model, reason="deepseek provider is not configured")
+        else:
+            api_key = getattr(settings, "anthropic_api_key", None)
+            base_url = getattr(settings, "anthropic_base_url", None)
+            adapter = AnthropicAdapter(api_key=api_key, base_url=base_url, model=concrete_model, public_model=model) if api_key else UnavailableAdapter(model=model, reason="anthropic provider is not configured")
         registry.register(model, adapter)
     return registry
 

@@ -28,7 +28,7 @@ class Settings(BaseSettings):
 
     # OpenAI and DeepSeek are the first production comparison pair.  A caller can
     # still select ``deterministic`` explicitly for local/offline fixtures.
-    crosscheck_models: str = Field(default="gpt-4o-mini,deepseek-chat", alias="CROSSCHECK_MODELS")
+    crosscheck_models: str = Field(default="gpt-4o-mini,claude-3-5-sonnet-latest,deepseek-chat", alias="CROSSCHECK_MODELS")
     allowed_models: str | None = Field(default=None, alias="CROSSCHECK_ALLOWED_MODELS")
 
     prompt_version: str = "unified-v1"
@@ -72,11 +72,19 @@ class Settings(BaseSettings):
     openai_api_key: str | None = None
     openai_base_url: str = "https://api.openai.com/v1"
     anthropic_api_key: str | None = None
+    anthropic_base_url: str = "https://api.anthropic.com"
     deepseek_api_key: str | None = None
     deepseek_base_url: str = "https://api.deepseek.com/v1"
     tavily_api_key: str | None = None
 
     cache_ttl_seconds: int = Field(default=86_400, gt=0)
+    cache_lock_seconds: int = Field(default=20, gt=0, le=120)
+    clustering_threshold: float = Field(default=0.85, gt=0.0, le=1.0)
+    lexical_clustering_threshold: float = Field(default=0.92, gt=0.0, le=1.0)
+    embedding_model: str = "text-embedding-3-small"
+    tavily_max_results: int = Field(default=5, ge=5, le=10)
+    sandbox_image: str = "crosscheck-python-sandbox:3.11.9"
+    sandbox_timeout_seconds: float = Field(default=5.0, gt=0.0, le=30.0)
 
     @model_validator(mode="after")
     def validate_retry_bounds(self) -> "Settings":

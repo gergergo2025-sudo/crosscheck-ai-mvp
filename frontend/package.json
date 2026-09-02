@@ -22,6 +22,7 @@
     "jsdom": "latest",
     "tailwindcss": "latest",
     "vite": "latest",
-    "vitest": "latest"
+    "vitest": "latest",
+    "vitest-axe": "^0.1.0"
   }
 }

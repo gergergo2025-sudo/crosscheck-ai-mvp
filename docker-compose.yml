@@ -1,0 +1,50 @@
+services:
+  postgres:
+    image: postgres:15.14-alpine3.21@sha256:07a070c416dbc8f4b01c8150d311e625758feefc4601710f95cd95b371f80e2e
+    environment: {POSTGRES_DB: crosscheck, POSTGRES_USER: crosscheck, POSTGRES_PASSWORD: crosscheck}
+    healthcheck: {test: ["CMD-SHELL", "pg_isready -U crosscheck -d crosscheck"], interval: 3s, timeout: 3s, retries: 20}
+    volumes: ["postgres-data:/var/lib/postgresql/data"]
+  redis:
+    image: redis:7.4.5-alpine3.21@sha256:bb186d083732f669da90be8b0f975a37812b15e913465bb14d845db72a4e3e08
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck: {test: ["CMD", "redis-cli", "ping"], interval: 3s, timeout: 3s, retries: 20}
+  sandbox-image:
+    image: crosscheck-python-sandbox:3.11.9
+    build: {context: ./sandbox}
+    command: ["python", "-I", "-B", "-c", "print('sandbox image ready')"]
+    restart: "no"
+  migrate:
+    build: .
+    command: ["uv", "run", "python", "-m", "crosscheck.migrate"]
+    environment: {DATABASE_URL: "postgresql+asyncpg://crosscheck:crosscheck@postgres:5432/crosscheck"}
+    depends_on: {postgres: {condition: service_healthy}}
+    restart: "no"
+  backend:
+    build: .
+    environment:
+      DATABASE_URL: postgresql+asyncpg://crosscheck:crosscheck@postgres:5432/crosscheck
+      REDIS_URL: redis://redis:6379/0
+      SANDBOX_IMAGE: crosscheck-python-sandbox:3.11.9
+      CROSSCHECK_MODELS: ${CROSSCHECK_MODELS:-gpt-4o-mini,claude-3-5-sonnet-latest,deepseek-chat}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      TAVILY_API_KEY: ${TAVILY_API_KEY:-}
+    ports: ["8000:8000"]
+    volumes: ["/var/run/docker.sock:/var/run/docker.sock"]
+    group_add: ["${DOCKER_GID:-0}"]
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      migrate: {condition: service_completed_successfully}
+      sandbox-image: {condition: service_completed_successfully}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  frontend:
+    build: ./frontend
+    ports: ["5173:8080"]
+    depends_on: {backend: {condition: service_healthy}}
+volumes: {postgres-data: {}}

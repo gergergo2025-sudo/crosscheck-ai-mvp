@@ -42,7 +42,7 @@ from .errors import (
     ReportPersistenceUnavailable,
     RequestValidationError,
 )
-from .parser import parse_with_repair
+from .parser import parse_structured_answer, parse_with_repair
 from .persistence import PersistenceError, ReportStore
 from .prompt import build_repair_prompt, build_unified_prompt
 from .scoring import NeutralScorer, Scorer, ScoringOutcome
@@ -100,7 +100,7 @@ def _merge_adapter_results(first: AdapterResult, second: AdapterResult | None) -
             "reported_cost": (first.reported_cost or 0.0) + (second.reported_cost or 0.0)
             if first.reported_cost is not None or second.reported_cost is not None
             else None,
-            "retry_count": first.retry_count,
+            "retry_count": first.retry_count + second.retry_count,
         }
     )
 
@@ -275,6 +275,31 @@ def _apply_cluster_ids(
     ]
 
 
+def _degraded_answer(*, answer_id: UUID, model: str, provider: str, diagnostics: list[str],
+                     provider_status: str, failure_class: str | None, retry_count: int = 0,
+                     answer: str = "Provider did not return an answer.", result: AdapterResult | None = None) -> ModelAnswer:
+    """Build one consistent fail-closed ModelAnswer for every degraded path."""
+    return ModelAnswer(
+        id=answer_id, model=model, provider=provider, answer=answer, reasoning="", claims=[],
+        constraints_check={}, parse_status="degraded", parse_diagnostics=diagnostics, score=0.0,
+        latency_ms=result.latency_ms if result else None,
+        token_usage=_sanitize_token_usage(result.token_usage) if result else None,
+        reported_cost=result.reported_cost if result else None,
+        retry_count=max(0, retry_count), provider_status=provider_status,
+        failure_class=_safe_failure_value(failure_class, default="provider_error" if failure_class else None),
+    )
+
+
+def _is_high_compliance(question: str) -> bool:
+    normalized = question.casefold()
+    terms = (
+        "medical", "medicine", "diagnos", "treatment", "symptom", "doctor", "health", "医疗", "诊断", "治疗", "症状",
+        "legal", "lawyer", "lawsuit", "contract law", "法律", "诉讼", "律师",
+        "financial advice", "invest", "stock", "loan", "mortgage", "保险", "投资", "股票", "贷款",
+    )
+    return any(term in normalized for term in terms)
+
+
 class QueryService:
     """Coordinates ports and persists one immutable Report graph per request."""
 
@@ -319,9 +344,32 @@ class QueryService:
         return {
             "prompt": self.settings.prompt_version,
             "adapters": getattr(self.adapters, "configuration_version", "1"),
-            "clustering": f"{getattr(self.clusterer, 'method', 'none')}:{getattr(self.clusterer, 'version', '0')}",
-            "verifiers": getattr(self.verifiers, "version_set", lambda: "none")(),
+            "adapter_runtime": {
+                "attempt_timeout": self.settings.adapter_attempt_timeout_seconds,
+                "max_retries": self.settings.adapter_max_retries,
+                "backoff": [self.settings.retry_backoff_base_seconds, self.settings.retry_backoff_max_seconds],
+                "max_raw_chars": self.settings.max_raw_response_chars,
+                "cost_ceiling": self.settings.max_query_cost_usd,
+                "cost_estimates": dict(sorted(self.settings.model_cost_estimates.items())),
+                "openai_base_url": self.settings.openai_base_url,
+                "anthropic_base_url": self.settings.anthropic_base_url,
+                "deepseek_base_url": self.settings.deepseek_base_url,
+            },
+            "clustering": {
+                "method": getattr(self.clusterer, "method", "none"),
+                "version": getattr(self.clusterer, "version", "0"),
+                "threshold": getattr(self.clusterer, "threshold", None),
+                "lexical_threshold": getattr(self.clusterer, "lexical_threshold", None),
+                "embedding": getattr(getattr(self.clusterer, "embedder", None), "version", "none"),
+            },
+            "verifiers": {
+                "versions": getattr(self.verifiers, "version_set", lambda: "none")(),
+                "tavily_results": self.settings.tavily_max_results,
+                "sandbox_image": self.settings.sandbox_image,
+                "sandbox_timeout": self.settings.sandbox_timeout_seconds,
+            },
             "scoring": getattr(self.scorer, "version", "0"),
+            "constraints": getattr(self.constraint_service, "version", "reported-v1"),
         }
 
     async def _cluster_claims(
@@ -528,21 +576,28 @@ class QueryService:
             raise
         except BaseException:
             result = VerificationResult(status="unavailable", failure_class="verifier_error", details={"reason": "verifier failed"})
-        result = result.model_copy(
-            update={
-                "evidence": _sanitize_evidence(
-                    result.evidence,
-                    max_count=self.settings.max_evidence_count,
-                    max_snippet_chars=self.settings.max_evidence_snippet_chars,
-                )
-            }
-        )
+        evidence = _sanitize_evidence(result.evidence, max_count=self.settings.max_evidence_count,
+                                      max_snippet_chars=self.settings.max_evidence_snippet_chars)
+        evidence_ids: list[UUID] = []
+        normalized_evidence: list[dict[str, Any]] = []
+        for item in evidence:
+            try:
+                evidence_id = UUID(str(item.get("id")))
+            except (ValueError, TypeError, AttributeError):
+                evidence_id = uuid4()
+            evidence_ids.append(evidence_id)
+            normalized_evidence.append({**item, "id": str(evidence_id)})
+        verification_id = result.id or uuid4()
+        result = result.model_copy(update={"id": verification_id, "evidence": normalized_evidence})
         updated = claim.model_copy(
             update={
                 "verification_status": result.status,
                 "verification_confidence": result.confidence,
+                "verification_ids": [verification_id],
+                "evidence_ids": evidence_ids,
             }
         )
+        self.telemetry.emit("verifier.completed", verifier=result.verifier_type, status=result.status, duration_ms=result.duration_ms)
         return updated, result
 
     async def _fan_out_adapters(
@@ -551,12 +606,13 @@ class QueryService:
         prompt: str,
         *,
         deadline: float,
+        budget: dict[str, float] | None = None,
     ) -> list[tuple[str, AdapterResult | None, BaseException | None]]:
         """Dispatch bounded provider work concurrently and isolate siblings."""
 
         dispatch: list[str] = []
         skipped: list[tuple[str, AdapterResult | None, BaseException | None]] = []
-        reserved_cost = 0.0
+        budget = budget if budget is not None else {"reserved": 0.0, "reported": 0.0}
         ceiling = self.settings.max_query_cost_usd
         for model in models:
             try:
@@ -566,7 +622,7 @@ class QueryService:
                 continue
             estimate = self._estimate_cost(model, adapter, prompt)
             if ceiling is not None and estimate is not None:
-                if reserved_cost + estimate > ceiling + 1e-12:
+                if budget["reserved"] + estimate > ceiling + 1e-12:
                     skipped.append(
                         (
                             model,
@@ -578,7 +634,7 @@ class QueryService:
                         )
                     )
                     continue
-                reserved_cost += estimate
+                budget["reserved"] += estimate
             dispatch.append(model)
 
         tasks = {
@@ -616,86 +672,84 @@ class QueryService:
         # deterministic for clients and tests.
         by_model = {model: by_task[tasks[model]] for model in dispatch}
         by_model.update({item[0]: item for item in skipped})
-        return [by_model[model] for model in models]
+        ordered = [by_model[model] for model in models]
+        for model, result, failure in ordered:
+            if result:
+                budget["reported"] += float(result.reported_cost or 0.0)
+                self.telemetry.emit("adapter.completed", model=model, provider=result.provider, status=result.status,
+                                    retry_count=result.retry_count, latency_ms=result.latency_ms,
+                                    token_count=(result.token_usage or {}).get("total_tokens"), reported_cost=result.reported_cost)
+                if result.retry_count:
+                    self.telemetry.emit("adapter.retry", model=model, provider=result.provider, retry_count=result.retry_count)
+            else:
+                self.telemetry.emit("adapter.completed", model=model, provider=self._provider_name(model), status="unavailable",
+                                    retry_count=getattr(failure, "retry_count", 0))
+        return ordered
 
     async def _verify_claims(
         self,
         model_answers: list[ModelAnswer],
         *,
+        clustering: ClusteringOutcome,
         question: str,
         constraints: dict[str, Any] | str | None,
         deadline: float,
     ) -> tuple[list[ModelAnswer], dict[UUID, list[VerificationResult]]]:
-        jobs: dict[asyncio.Task[Any], tuple[int, int, Claim]] = {}
-        for answer_index, answer in enumerate(model_answers):
-            if answer.parse_status != "parsed":
-                continue
-            for claim_index, claim in enumerate(answer.claims):
-                jobs[
-                    asyncio.create_task(
-                        self._verify_claim(
-                            claim,
-                            question=question,
-                            constraints=constraints,
-                            deadline=deadline,
-                        )
-                    )
-                ] = (answer_index, claim_index, claim)
+        claims = {claim.id: claim for answer in model_answers if answer.parse_status == "parsed" for claim in answer.claims if claim.id}
+        representative_ids = [cluster.representative_claim_id for cluster in clustering.clusters if cluster.representative_claim_id]
+        clustered_ids = {claim_id for cluster in clustering.clusters for claim_id in cluster.claim_ids}
+        representative_ids.extend(claim_id for claim_id in claims if claim_id not in clustered_ids)
+        jobs = {
+            asyncio.create_task(self._verify_claim(claims[claim_id], question=question, constraints=constraints, deadline=deadline)): claim_id
+            for claim_id in representative_ids if claim_id in claims
+        }
         if not jobs:
             return model_answers, {}
-        done, pending = await asyncio.wait(
-            tuple(jobs),
-            timeout=max(0.0, deadline - self.clock()),
-        )
+        done, pending = await asyncio.wait(tuple(jobs), timeout=max(0.0, deadline - self.clock()))
         for task in pending:
             task.cancel()
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
-        updates: dict[tuple[int, int], tuple[Claim, VerificationResult]] = {}
+        representative_results: dict[UUID, tuple[Claim, VerificationResult]] = {}
+        for task, claim_id in jobs.items():
+            if task in done:
+                try:
+                    representative_results[claim_id] = task.result()
+                except BaseException:
+                    result = VerificationResult(id=uuid4(), status="unavailable", failure_class="verifier_error")
+                    representative_results[claim_id] = (claims[claim_id].model_copy(update={"verification_status": "unavailable", "verification_ids": [result.id]}), result)
+            else:
+                result = VerificationResult(id=uuid4(), status="unavailable", failure_class="deadline")
+                representative_results[claim_id] = (claims[claim_id].model_copy(update={"verification_status": "unavailable", "verification_ids": [result.id]}), result)
+
+        representative_for_claim = {claim_id: cluster.representative_claim_id for cluster in clustering.clusters for claim_id in cluster.claim_ids}
         verification_by_claim: dict[UUID, list[VerificationResult]] = {}
-        for task in done:
-            answer_index, claim_index, claim = jobs[task]
-            try:
-                updated_claim, verification = task.result()
-            except asyncio.CancelledError:
-                updated_claim = claim.model_copy(
-                    update={"verification_status": "unavailable", "verification_confidence": 0.0}
-                )
-                verification = VerificationResult(status="unavailable", failure_class="deadline")
-            except BaseException:
-                updated_claim = claim.model_copy(
-                    update={"verification_status": "unavailable", "verification_confidence": 0.0}
-                )
-                verification = VerificationResult(status="unavailable", failure_class="verifier_error")
-            updates[(answer_index, claim_index)] = (updated_claim, verification)
-            if updated_claim.id:
-                verification_by_claim[updated_claim.id] = [verification]
-        for task in pending:
-            answer_index, claim_index, claim = jobs[task]
-            updated_claim = claim.model_copy(
-                update={"verification_status": "unavailable", "verification_confidence": 0.0}
-            )
-            updates[(answer_index, claim_index)] = (
-                updated_claim,
-                VerificationResult(status="unavailable", failure_class="deadline"),
-            )
-            if updated_claim.id:
-                verification_by_claim[updated_claim.id] = [updates[(answer_index, claim_index)][1]]
         updated_answers: list[ModelAnswer] = []
-        for answer_index, answer in enumerate(model_answers):
-            updated_answers.append(
-                answer.model_copy(
-                    update={
-                        "claims": [
-                            updates.get(
-                                (answer_index, claim_index),
-                                (claim, VerificationResult(status="unavailable", failure_class="deadline")),
-                            )[0]
-                            for claim_index, claim in enumerate(answer.claims)
-                        ]
-                    }
-                )
-            )
+        for answer in model_answers:
+            updated_claims: list[Claim] = []
+            for claim in answer.claims:
+                if not claim.id:
+                    updated_claims.append(claim)
+                    continue
+                representative_id = representative_for_claim.get(claim.id, claim.id)
+                representative_claim, base_result = representative_results[representative_id]
+                if claim.id == representative_id:
+                    updated_claim, result = representative_claim, base_result
+                else:
+                    result = base_result.model_copy(update={"id": uuid4(), "details": {**base_result.details, "representative_claim_id": str(representative_id)}})
+                    updated_claim = claim.model_copy(update={
+                        "verification_status": result.status, "verification_confidence": result.confidence,
+                        "verification_ids": [result.id],
+                        "evidence_ids": [UUID(str(item["id"])) for item in result.evidence if item.get("id")],
+                    })
+                verification_by_claim[claim.id] = [result]
+                updated_claims.append(updated_claim)
+            updated_answers.append(answer.model_copy(update={"claims": updated_claims}))
+        for cluster in clustering.clusters:
+            result = verification_by_claim.get(cluster.representative_claim_id, [None])[0]
+            if result:
+                cluster.verification_status = result.status
+                cluster.verification_confidence = result.confidence
         return updated_answers, verification_by_claim
 
     async def execute(self, request: QueryRequest, *, request_id: UUID | None = None) -> ReportResponse:
@@ -755,12 +809,26 @@ class QueryService:
         )
         if not request.refresh:
             cached = await self.cache.get(cache_key)
+            if self.cache.warnings():
+                self.telemetry.emit("cache.error", request_id=str(request_id), outcome="degraded")
             if cached is not None:
                 self.telemetry.emit("cache.hit", request_id=str(request_id), report_id=str(cached.report_id))
                 return cached.model_copy(update={"cached": True})
             self.telemetry.emit("cache.miss", request_id=str(request_id))
+        lock_token: str | None = None
+        acquire_lock = getattr(self.cache, "acquire_lock", None)
+        if callable(acquire_lock):
+            lock_token = await acquire_lock(cache_key)
+            if lock_token is None and not request.refresh:
+                for _ in range(5):
+                    await self.sleeper(.05)
+                    cached = await self.cache.get(cache_key)
+                    if cached is not None:
+                        self.telemetry.emit("cache.hit", request_id=str(request_id), report_id=str(cached.report_id))
+                        return cached.model_copy(update={"cached": True})
 
-        results = await self._fan_out_adapters(selected_models, prompt, deadline=deadline)
+        cost_budget = {"reserved": 0.0, "reported": 0.0}
+        results = await self._fan_out_adapters(selected_models, prompt, deadline=deadline, budget=cost_budget)
         model_answers: list[ModelAnswer] = []
         raw_by_answer: dict[UUID, str] = {}
         failures: list[tuple[str, BaseException]] = []
@@ -785,25 +853,12 @@ class QueryService:
                 status = "skipped_cost_ceiling" if failure_class == "cost_ceiling" else (
                     "timeout" if failure_class in {"deadline", "timeout"} else "unavailable"
                 )
-                model_answers.append(
-                    ModelAnswer(
-                        id=answer_id,
-                        model=model,
-                        provider=provider,
-                        answer="Provider did not return an answer.",
-                        reasoning="",
-                        parse_status="degraded",
-                        parse_diagnostics=["provider call did not produce a usable result"],
-                        score=0.0,
-                        provider_status=status,
-                        failure_class=_safe_failure_value(failure_class, default="provider_error"),
-                        retry_count=max(0, int(getattr(failure, "retry_count", 0))),
-                    )
-                )
+                model_answers.append(_degraded_answer(answer_id=answer_id, model=model, provider=provider,
+                    diagnostics=["provider call did not produce a usable result"], provider_status=status,
+                    failure_class=failure_class, retry_count=int(getattr(failure, "retry_count", 0))))
                 degraded_models.append(model)
                 continue
 
-            reported_cost += float(adapter_result.reported_cost or 0.0)
             raw_text = _bounded_text(adapter_result.raw_text, self.settings.max_raw_response_chars)
             provider = _safe_provider_name(
                 adapter_result.provider,
@@ -820,20 +875,9 @@ class QueryService:
                     retry_count=adapter_result.retry_count,
                 )
                 failures.append((model, failure))
-                model_answers.append(
-                    ModelAnswer(
-                        id=answer_id,
-                        model=model,
-                        provider=provider,
-                        answer="Provider did not return an answer.",
-                        parse_status="degraded",
-                        parse_diagnostics=["provider returned no answer text"],
-                        score=0.0,
-                        provider_status=provider_status,
-                        failure_class=_safe_failure_value(_safe_failure_class(failure), default="provider_error"),
-                        retry_count=adapter_result.retry_count,
-                    )
-                )
+                model_answers.append(_degraded_answer(answer_id=answer_id, model=model, provider=provider,
+                    diagnostics=["provider returned no answer text"], provider_status=provider_status,
+                    failure_class=_safe_failure_class(failure), retry_count=adapter_result.retry_count, result=adapter_result))
                 degraded_models.append(model)
                 continue
 
@@ -848,6 +892,17 @@ class QueryService:
                     version=self.settings.prompt_version,
                     max_chars=min(self.settings.max_raw_response_chars, 30_000),
                 )
+                adapter = self.adapters.get(model)
+                estimate = self._estimate_cost(model, adapter, repair_prompt)
+                ceiling = self.settings.max_query_cost_usd
+                if ceiling is not None and (
+                    cost_budget["reported"] >= ceiling - 1e-12
+                    or (estimate is not None and cost_budget["reserved"] + estimate > ceiling + 1e-12)
+                ):
+                    repair_failure = AdapterInvocationError("cost_ceiling", provider=provider)
+                    raise repair_failure
+                if estimate is not None:
+                    cost_budget["reserved"] += estimate
                 _, repair_result, repair_failure = await self._call_adapter(
                     model,
                     repair_prompt,
@@ -855,36 +910,30 @@ class QueryService:
                 )
                 if repair_failure is not None or repair_result is None:
                     raise repair_failure or RuntimeError("repair did not return a response")
+                cost_budget["reported"] += float(repair_result.reported_cost or 0.0)
+                self.telemetry.emit("adapter.repair_completed", model=model, provider=repair_result.provider,
+                                    status=repair_result.status, retry_count=repair_result.retry_count,
+                                    latency_ms=repair_result.latency_ms, reported_cost=repair_result.reported_cost)
+                if repair_result.retry_count:
+                    self.telemetry.emit("adapter.retry", model=model, provider=repair_result.provider, retry_count=repair_result.retry_count)
                 return _bounded_text(repair_result.raw_text, self.settings.max_raw_response_chars)
 
-            parsed = await parse_with_repair(
-                raw_text,
-                repair_response,
-                max_chars=self.settings.max_raw_response_chars,
-            )
+            # Parse the adapter-contract-bounded response before applying the
+            # tighter persistence/repair-prompt cap. This avoids turning a valid
+            # response into malformed JSON solely because audit storage is small.
+            parsed = parse_structured_answer(adapter_result.raw_text, max_chars=120_000)
+            if not parsed.parse_success:
+                parsed = await parse_with_repair(raw_text, repair_response, max_chars=self.settings.max_raw_response_chars)
             effective_result = _merge_adapter_results(adapter_result, repair_result)
+            reported_cost += float(effective_result.reported_cost or 0.0)
+            self.telemetry.emit("parse.completed", model=model, parse_status=parsed.parse_status,
+                                repair_attempted=parsed.repair_attempted, repair_succeeded=parsed.repair_succeeded)
             if parsed.structured is None:
-                model_answer = ModelAnswer(
-                    id=answer_id,
-                    model=model,
-                    provider=provider,
+                model_answer = _degraded_answer(answer_id=answer_id, model=model, provider=provider,
                     answer=_bounded_text(raw_text or "No answer text was returned.", 100_000),
-                    reasoning="",
-                    claims=[],
-                    constraints_check={},
-                    parse_status="degraded",
-                    parse_diagnostics=parsed.diagnostics,
-                    score=0.0,
-                    latency_ms=effective_result.latency_ms,
-                    token_usage=_sanitize_token_usage(effective_result.token_usage),
-                    reported_cost=effective_result.reported_cost,
-                    retry_count=adapter_result.retry_count,
-                    provider_status=provider_status,
-                    failure_class=_safe_failure_value(
-                        adapter_result.failure_class
-                        or (_safe_failure_class(repair_failure) if repair_failure is not None else None)
-                    ),
-                )
+                    diagnostics=parsed.diagnostics, provider_status=provider_status,
+                    failure_class=adapter_result.failure_class or (_safe_failure_class(repair_failure) if repair_failure else None),
+                    retry_count=effective_result.retry_count, result=effective_result)
                 model_answers.append(model_answer)
                 raw_by_answer[answer_id] = raw_text
                 degraded_models.append(model)
@@ -909,7 +958,7 @@ class QueryService:
                 latency_ms=effective_result.latency_ms,
                 token_usage=_sanitize_token_usage(effective_result.token_usage),
                 reported_cost=effective_result.reported_cost,
-                retry_count=adapter_result.retry_count,
+                retry_count=effective_result.retry_count,
                 provider_status=provider_status,
                 failure_class=_safe_failure_value(adapter_result.failure_class),
             )
@@ -918,22 +967,24 @@ class QueryService:
             responded_answer_ids.add(answer_id)
 
         usable_answers = [answer for answer in model_answers if answer.parse_status == "parsed" and answer.answer.strip()]
-        report_answers = [answer for answer in model_answers if answer.id in responded_answer_ids]
-        if not report_answers:
-            # All-provider failures are intentionally non-durable: no empty or
-            # misleading Report enters persistence/cache.  A provider that did
-            # answer, even unparseably, still deserves an inspectable Report.
+        if not usable_answers:
+            release_lock = getattr(self.cache, "release_lock", None)
+            if lock_token and callable(release_lock):
+                await release_lock(cache_key, lock_token)
             raise NoUsableModelAnswer()
 
+        clustering = await self._cluster_claims(model_answers, deadline=deadline)
+        model_answers = _apply_cluster_ids(model_answers, clustering)
         model_answers, verification_by_claim = await self._verify_claims(
-            model_answers,
+            model_answers, clustering=clustering,
             question=request.question,
             constraints=request.constraints,
             deadline=deadline,
         )
-        clustering = await self._cluster_claims(model_answers, deadline=deadline)
-        model_answers = _apply_cluster_ids(model_answers, clustering)
         constraint_outcome = await self._check_constraints(request, model_answers, deadline=deadline)
+        model_answers = [answer.model_copy(update={"constraints_check": {
+            item["constraint"]: item for item in constraint_outcome.per_answer.get(answer.id, [])
+        }}) for answer in model_answers]
         consensus, disagreements = build_consensus_and_disagreements(
             model_answers,
             clustering=clustering,
@@ -959,6 +1010,10 @@ class QueryService:
             (answer for answer in model_answers if answer.id == scoring.recommended_answer_id),
             None,
         )
+        evidence_only = _is_high_compliance(request.question)
+        if evidence_only:
+            recommended_answer = None
+            scoring.recommendation_message = "Evidence-only report: automated decision endorsement is suppressed for high-compliance topics."
         status = "partial" if failures or degraded_models else "complete"
         warnings: list[str] = []
         for model, failure in failures:
@@ -1004,7 +1059,7 @@ class QueryService:
                 for verification in verification_by_claim.get(claim.id, []):
                     all_evidence.extend(verification.evidence)
         evidence = _sanitize_evidence(
-            all_evidence,
+            list({str(item.get("id") or (item.get("url"), item.get("title"))): item for item in all_evidence}.values()),
             max_count=self.settings.max_evidence_count,
             max_snippet_chars=self.settings.max_evidence_snippet_chars,
         )
@@ -1023,6 +1078,9 @@ class QueryService:
             evidence=evidence,
             constraints_check=constraint_outcome.aggregate,
             warnings=warnings,
+            behavior_versions=self.behaviour_versions(),
+            cache_key_version="cachekey-v1",
+            evidence_only=evidence_only,
         )
         try:
             await self.store.persist_report(
@@ -1032,10 +1090,19 @@ class QueryService:
                 raw_by_answer=raw_by_answer,
                 verification_by_claim=verification_by_claim,
                 clusters=clustering,
+                cache_key=cache_key,
+                cache_key_version="cachekey-v1",
             )
         except PersistenceError as exc:
             raise ReportPersistenceUnavailable() from exc
         await self.cache.set(cache_key, report)
+        if self.cache.warnings():
+            self.telemetry.emit("cache.error", request_id=str(request_id), report_id=str(report_id), outcome="degraded")
+        release_lock = getattr(self.cache, "release_lock", None)
+        if lock_token and callable(release_lock):
+            await release_lock(cache_key, lock_token)
+        self.telemetry.emit("persistence.completed", request_id=str(request_id), report_id=str(report_id), status="committed")
+        self.telemetry.emit("scoring.completed", request_id=str(request_id), report_id=str(report_id), score=max(scoring.scores.values(), default=0.0))
         self.telemetry.emit(
             "query.completed",
             request_id=str(request_id),
