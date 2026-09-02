@@ -16,7 +16,9 @@ def default_verifier_registry(settings: Settings) -> VerifierRegistry:
     """Build the configured Verifier registry without contacting any service."""
 
     registry = VerifierRegistry()
-    if settings.tavily_api_key:
-        registry.register("fact", FactVerifier(settings.tavily_api_key, max_results=settings.tavily_max_results))
+    # Keep the Fact verifier registered even when its optional credential is
+    # absent so the public result distinguishes unavailable configuration from
+    # an inconclusive search.
+    registry.register("fact", FactVerifier(settings.tavily_api_key, max_results=settings.tavily_max_results))
     registry.register("code", CodeVerifier(settings.sandbox_image, timeout_seconds=settings.sandbox_timeout_seconds))
     return registry

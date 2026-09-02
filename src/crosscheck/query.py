@@ -819,13 +819,22 @@ class QueryService:
         acquire_lock = getattr(self.cache, "acquire_lock", None)
         if callable(acquire_lock):
             lock_token = await acquire_lock(cache_key)
-            if lock_token is None and not request.refresh:
-                for _ in range(5):
-                    await self.sleeper(.05)
+            if lock_token is None:
+                # A lock miss means another identical query owns provider
+                # fan-out. Wait for its committed Report, or take ownership if
+                # its lock expires/fails, instead of duplicating paid work after
+                # an arbitrary 250 ms polling window.
+                while self.clock() < deadline:
+                    await self.sleeper(min(0.05, max(0.0, deadline - self.clock())))
                     cached = await self.cache.get(cache_key)
-                    if cached is not None:
+                    if cached is not None and not request.refresh:
                         self.telemetry.emit("cache.hit", request_id=str(request_id), report_id=str(cached.report_id))
                         return cached.model_copy(update={"cached": True})
+                    lock_token = await acquire_lock(cache_key)
+                    if lock_token is not None:
+                        break
+                if lock_token is None:
+                    raise NoUsableModelAnswer()
 
         cost_budget = {"reserved": 0.0, "reported": 0.0}
         results = await self._fan_out_adapters(selected_models, prompt, deadline=deadline, budget=cost_budget)

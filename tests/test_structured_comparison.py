@@ -176,7 +176,8 @@ async def test_http_comparison_repairs_one_provider_and_keeps_answers_side_by_si
         )
     assert response.status_code == 200
     body = response.json()
-    assert body["status"] == "complete"
+    assert body["status"] == "partial"
+    assert "one or more verifier checks were unavailable" in body["warnings"]
     assert [answer["provider"] for answer in body["model_comparison"]] == ["openai", "deepseek"]
     assert all(answer["parse_status"] == "parsed" for answer in body["model_comparison"])
     assert body["model_comparison"][0]["parse_diagnostics"] == ["structured response repaired"]

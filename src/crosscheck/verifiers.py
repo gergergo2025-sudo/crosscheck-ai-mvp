@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import os
 import re
 import selectors
@@ -87,7 +88,7 @@ class FactVerifier:
     verifier_type = "fact"
     verifier_version = "tavily-v2"
 
-    def __init__(self, api_key: str, *, max_results: int = 5, http_client: httpx.AsyncClient | None = None) -> None:
+    def __init__(self, api_key: str | None, *, max_results: int = 5, http_client: httpx.AsyncClient | None = None) -> None:
         self.api_key = api_key
         self.max_results = max(5, min(10, max_results))
         self.http_client = http_client
@@ -107,10 +108,57 @@ class FactVerifier:
         # primary/high-authority status.
         return 0.55
 
+    @staticmethod
+    def _recency(publication_date: object) -> tuple[str | None, float]:
+        if not isinstance(publication_date, str) or not publication_date.strip():
+            return None, 0.5
+        value = publication_date.strip()
+        try:
+            published = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if published.tzinfo is None:
+                published = published.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return value[:100], 0.0
+        age_days = (datetime.now(timezone.utc) - published.astimezone(timezone.utc)).days
+        if age_days < -30:
+            return value[:100], 0.0
+        if age_days <= 366:
+            return value[:100], 1.0
+        if age_days <= 3 * 366:
+            return value[:100], 0.8
+        if age_days <= 5 * 366:
+            return value[:100], 0.6
+        return value[:100], 0.3
+
+    @staticmethod
+    def _relation(row: Mapping[str, Any], *, overlap: float, claim_tokens: set[str], result_tokens: set[str]) -> str:
+        supplied = str(row.get("relation", "")).casefold()
+        if supplied in {"conflict", "conflicting", "contradicting", "contradiction"}:
+            return "conflicting"
+        if supplied in {"support", "supporting"}:
+            return "supporting"
+        negations = {"not", "no", "never", "false", "incorrect", "isn", "wasn", "doesn", "cannot"}
+        opposite_polarity = bool(claim_tokens & negations) != bool(result_tokens & negations)
+        if overlap >= 0.55 and opposite_polarity:
+            return "conflicting"
+        if overlap >= 0.55:
+            return "supporting"
+        return "related"
+
     async def verify(self, claim: Claim, *, question: str, constraints: dict[str, Any] | str | None,
                      deadline: float | None = None) -> VerificationResult:
         del question, constraints
         started = time.perf_counter()
+        if not self.api_key:
+            return VerificationResult(
+                verifier_type=self.verifier_type,
+                verifier_version=self.verifier_version,
+                status="unavailable",
+                confidence=0.0,
+                failure_class="configuration_unavailable",
+                details={"reason": "fact search is not configured"},
+                duration_ms=(time.perf_counter() - started) * 1000,
+            )
         timeout = 8.0 if deadline is None else max(0.001, min(8.0, deadline - time.monotonic()))
         client = self.http_client or httpx.AsyncClient()
         owned = self.http_client is None
@@ -126,24 +174,34 @@ class FactVerifier:
         claim_tokens = set(re.findall(r"\w+", claim.claim.casefold()))
         evidence: list[dict[str, Any]] = []
         support_scores: list[float] = []
+        conflict_scores: list[float] = []
         for rank, row in enumerate(rows, 1):
             if not isinstance(row, Mapping):
                 continue
             text_value = f"{row.get('title', '')} {row.get('content', '')}"
             result_tokens = set(re.findall(r"\w+", text_value.casefold()))
-            relation = len(claim_tokens & result_tokens) / max(1, len(claim_tokens))
+            overlap = len(claim_tokens & result_tokens) / max(1, len(claim_tokens))
             url = str(row.get("url", ""))
             domain = (urlsplit(url).hostname or "").casefold().removeprefix("www.")
             authority = self._authority(domain)
-            evidence.append({"id": str(uuid4()), "url": row.get("url"), "title": row.get("title"), "snippet": str(row.get("content", ""))[:1000], "domain": domain, "rank": rank, "authority": authority, "relation": "supporting" if relation >= .55 else "context"})
-            if relation >= .55:
-                support_scores.append((relation + authority) / 2)
+            publication_date, recency = self._recency(row.get("published_date") or row.get("publication_date"))
+            relation = self._relation(row, overlap=overlap, claim_tokens=claim_tokens, result_tokens=result_tokens)
+            evidence_score = (overlap + authority + recency) / 3
+            evidence.append({"id": str(uuid4()), "url": row.get("url"), "title": row.get("title"), "snippet": str(row.get("content", ""))[:1000], "domain": domain, "publication_date": publication_date, "rank": rank, "authority": authority, "recency": recency, "relation": relation})
+            if relation == "supporting":
+                support_scores.append(evidence_score)
+            elif relation == "conflicting" and authority >= 0.55:
+                conflict_scores.append(evidence_score)
         supporting = [item for item in evidence if item["relation"] == "supporting"]
         independent_domains = {item["domain"] for item in supporting if item["domain"]}
         has_primary = any(item["authority"] >= 0.8 for item in supporting)
-        status = "verified" if has_primary or len(independent_domains) >= 2 else "unverified"
-        confidence = min(1.0, sum(support_scores) / len(support_scores)) if support_scores else 0.0
-        return VerificationResult(verifier_type=self.verifier_type, verifier_version=self.verifier_version, status=status, confidence=confidence, evidence=evidence, details={"result_count": len(evidence), "support_count": len(support_scores)}, duration_ms=(time.perf_counter() - started) * 1000)
+        if conflict_scores:
+            status = "conflict"
+            confidence = max(conflict_scores)
+        else:
+            status = "verified" if has_primary or len(independent_domains) >= 2 else "unverified"
+            confidence = min(1.0, sum(support_scores) / len(support_scores)) if support_scores else 0.0
+        return VerificationResult(verifier_type=self.verifier_type, verifier_version=self.verifier_version, status=status, confidence=confidence, evidence=evidence, details={"result_count": len(evidence), "support_count": len(support_scores), "conflict_count": len(conflict_scores)}, duration_ms=(time.perf_counter() - started) * 1000)
 
 
 @dataclass(frozen=True)
@@ -306,6 +364,33 @@ class CodeVerifier:
                     "output": process.stdout,
                     "output_truncated": process.output_truncated,
                 },
+                duration_ms=(time.perf_counter() - started) * 1000,
+            )
+        # Docker reserves 125-127 for failures to start the container (including
+        # a missing --pull=never image). These are infrastructure availability
+        # failures, not evidence that the submitted code conflicts with tests.
+        # Do not return daemon stderr because it may contain registry/image or
+        # host details.
+        daemon_error = process.stderr.casefold()
+        docker_start_failure = process.returncode in {125, 126, 127} or any(
+            marker in daemon_error
+            for marker in (
+                "error response from daemon",
+                "cannot connect to the docker daemon",
+                "unable to find image",
+                "no such image",
+                "pull access denied",
+                "docker daemon socket",
+            )
+        )
+        if docker_start_failure:
+            return VerificationResult(
+                verifier_type=self.verifier_type,
+                verifier_version=self.verifier_version,
+                status="unavailable",
+                confidence=0.0,
+                failure_class="sandbox_unavailable",
+                details={"reason": "sandbox image or Docker service unavailable"},
                 duration_ms=(time.perf_counter() - started) * 1000,
             )
         passed = process.returncode == 0

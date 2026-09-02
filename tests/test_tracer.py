@@ -39,7 +39,8 @@ async def test_health_is_exact_and_query_persists_graph(tmp_path: Path):
         response = await client.post("/api/query", json={"question": "Who wrote this?"})
         assert response.status_code == 200
         body = response.json()
-        assert body["status"] == "complete"
+        assert body["status"] == "partial"
+        assert "one or more verifier checks were unavailable" in body["warnings"]
         assert body["question"]["question_type"] == "fact"
         assert body["question"]["question_type_origin"] == "classifier"
         answer = body["model_comparison"][0]
