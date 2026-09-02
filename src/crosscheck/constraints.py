@@ -58,7 +58,7 @@ class ReportedConstraintService:
 class IndependentConstraintService:
     """Rule-based, provenance-preserving checks for explicit MVP constraints."""
 
-    version = "constraint-v2"
+    version = "constraint-v3"
 
     @staticmethod
     def _submitted(value: dict[str, Any] | str | None) -> dict[str, Any]:
@@ -76,6 +76,50 @@ class IndependentConstraintService:
         match = re.search(r"[\d,.]+", str(value))
         return float(match.group().replace(",", "")) if match else None
 
+    @staticmethod
+    def _currency(value: Any) -> str | None:
+        text = str(value).upper()
+        if "USD" in text or "US$" in text or "$" in text:
+            return "USD"
+        if any(token in text for token in ("CNY", "RMB", "¥", "￥", "元")):
+            return "CNY"
+        if "EUR" in text or "€" in text:
+            return "EUR"
+        if "GBP" in text or "£" in text:
+            return "GBP"
+        return None
+
+    @classmethod
+    def _money(cls, value: Any) -> tuple[float | None, str | None]:
+        if isinstance(value, dict):
+            amount = cls._number(value.get("value", value.get("amount")))
+            currency = cls._currency(value.get("currency", ""))
+            return amount, currency
+        return cls._number(value), cls._currency(value)
+
+    @classmethod
+    def _observed_money(cls, answer: str) -> tuple[float | None, str | None]:
+        price = re.search(
+            r"(?:price|cost|价格|售价)\s*[:：]?\s*"
+            r"(?P<prefix>US\$|USD|CNY|RMB|[$¥￥€£])?\s*"
+            r"(?P<amount>[\d,.]+)\s*"
+            r"(?P<suffix>USD|CNY|RMB|EUR|GBP|美元|元)?",
+            answer,
+            re.I,
+        )
+        if not price:
+            price = re.search(
+                r"(?P<prefix>US\$|USD|CNY|RMB|[$¥￥€£])\s*"
+                r"(?P<amount>[\d,.]+)\s*"
+                r"(?P<suffix>USD|CNY|RMB|EUR|GBP|美元|元)?",
+                answer,
+                re.I,
+            )
+        if not price:
+            return None, None
+        currency_text = f"{price.group('prefix') or ''} {price.group('suffix') or ''}"
+        return cls._number(price.group("amount")), cls._currency(currency_text)
+
     async def check(self, request: QueryRequest, answers: list[ModelAnswer], *, deadline: float | None = None) -> ConstraintOutcome:
         del deadline
         submitted = self._submitted(request.constraints)
@@ -91,14 +135,21 @@ class IndependentConstraintService:
                 status = "indeterminate"
                 reason = "the answer did not expose a comparable value"
                 if name in {"budget", "price", "max_price"}:
-                    expected_number = self._number(expected)
-                    price = re.search(r"(?:price|cost|价格|售价)?\s*[:：]?\s*[¥￥$]?\s*([\d,.]+)\s*(?:元|rmb|usd|美元)?", answer.answer, re.I)
-                    observed = self._number(price.group(1)) if price else None
+                    expected_number, expected_currency = self._money(expected)
+                    observed_number, observed_currency = self._observed_money(answer.answer)
+                    observed = observed_number
                     comparator = "lte"
-                    if expected_number is not None and observed is not None:
-                        status = "satisfied" if observed <= expected_number else "violated"
+                    if expected_currency:
+                        expected = {"value": expected_number, "currency": expected_currency}
+                        observed = {"value": observed_number, "currency": observed_currency} if observed_number is not None else None
+                    else:
+                        expected = expected_number
+                    if expected_currency and expected_currency != observed_currency:
+                        status = "indeterminate"
+                        reason = "expected and observed currency values are not safely comparable"
+                    elif expected_number is not None and observed_number is not None:
+                        status = "satisfied" if observed_number <= expected_number else "violated"
                         reason = "observed value is within the maximum" if status == "satisfied" else "observed value exceeds the maximum"
-                    expected = expected_number
                 else:
                     values = expected if isinstance(expected, list) else [expected]
                     wanted = [str(item).casefold() for item in values]

@@ -67,21 +67,21 @@ async def test_constraints_are_independently_checked_per_answer():
     assert checks[0]["observed"] == 4500
 
 
-def test_evidence_scorer_recommends_at_threshold_and_excludes_degraded():
+def test_evidence_scorer_applies_assurance_caps_and_excludes_degraded():
     answer = _answer("m1", "p1", "claim")
     claim_id = answer.claims[0].id
     assert claim_id
     result = VerificationResult(id=uuid4(), verifier_type="fact", status="verified", confidence=1, evidence=[{"authority": 1}])
     scorer = EvidenceScorer()
     outcome = scorer.score([answer], clustering=type("C", (), {"clusters": []})(), verification_by_claim={claim_id: [result]}, constraint_results={}, usable_provider_count=1)
-    assert outcome.scores[answer.id] >= .6
-    assert outcome.recommended_answer_id == answer.id
+    assert outcome.scores[answer.id] == .59
+    assert outcome.recommended_answer_id is None
     threshold_answer = ModelAnswer(id=uuid4(), model="threshold", provider="p", answer="ok")
     at_threshold = [{"status": "satisfied"}] * 3 + [{"status": "violated"}] * 2
     below_threshold = [{"status": "satisfied"}] * 2 + [{"status": "violated"}] * 3
     at = scorer.score([threshold_answer], clustering=type("C", (), {"clusters": []})(), verification_by_claim={}, constraint_results={threshold_answer.id: at_threshold}, usable_provider_count=1)
     below = scorer.score([threshold_answer], clustering=type("C", (), {"clusters": []})(), verification_by_claim={}, constraint_results={threshold_answer.id: below_threshold}, usable_provider_count=1)
-    assert at.scores[threshold_answer.id] == .6 and at.recommended_answer_id == threshold_answer.id
+    assert at.scores[threshold_answer.id] == .59 and at.recommended_answer_id is None
     assert below.scores[threshold_answer.id] < .6 and below.recommended_answer_id is None
     degraded = answer.model_copy(update={"id": uuid4(), "parse_status": "degraded"})
     assert scorer.score([degraded], clustering=type("C", (), {"clusters": []})(), verification_by_claim={}, constraint_results={}, usable_provider_count=0).recommended_answer_id is None
@@ -242,7 +242,11 @@ async def test_fact_and_code_verifiers_have_bounded_negative_and_positive_paths(
         result = await FactVerifier("secret", http_client=client).verify(Claim(claim="Paris is the capital of France", type="fact", confidence=.8), question="q", constraints=None)
     assert result.status == "verified" and len(result.evidence) == 1
 
-    monkeypatch.setattr("crosscheck.verifiers.subprocess.run", lambda command, **kwargs: SimpleNamespace(returncode=0, stdout="ok", stderr=""))
+    monkeypatch.setattr(
+        CodeVerifier,
+        "_run_bounded",
+        staticmethod(lambda command, script, **kwargs: SimpleNamespace(returncode=0, stdout="ok", stderr="", output_truncated=False, timed_out=False)),
+    )
     code = Claim(claim="```python\ndef add(a,b): return a+b\n```", type="code", confidence=.8)
     code_result = await CodeVerifier("pinned-image").verify(code, question="Tests:\n```python\nassert add(1,2)==3\n```", constraints=None)
     assert code_result.status == "verified"

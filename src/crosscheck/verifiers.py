@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
+import os
 import re
+import selectors
 import subprocess
 import time
 from typing import Any, Mapping, Protocol
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 import httpx
@@ -81,12 +85,27 @@ class VerifierRegistry:
 
 class FactVerifier:
     verifier_type = "fact"
-    verifier_version = "tavily-v1"
+    verifier_version = "tavily-v2"
 
     def __init__(self, api_key: str, *, max_results: int = 5, http_client: httpx.AsyncClient | None = None) -> None:
         self.api_key = api_key
         self.max_results = max(5, min(10, max_results))
         self.http_client = http_client
+
+    @staticmethod
+    def _is_host(hostname: str, expected: str) -> bool:
+        """Match an authority host itself or a real subdomain, never a substring."""
+
+        return hostname == expected or hostname.endswith(f".{expected}")
+
+    @classmethod
+    def _authority(cls, hostname: str) -> float:
+        trusted_publishers = ("reuters.com", "apnews.com", "nature.com", "science.org", "bbc.com", "bbc.co.uk")
+        if hostname.endswith((".gov", ".edu")) or any(cls._is_host(hostname, publisher) for publisher in trusted_publishers):
+            return 0.9
+        # Wikipedia is useful corroboration but is deliberately not elevated to
+        # primary/high-authority status.
+        return 0.55
 
     async def verify(self, claim: Claim, *, question: str, constraints: dict[str, Any] | str | None,
                      deadline: float | None = None) -> VerificationResult:
@@ -114,23 +133,122 @@ class FactVerifier:
             result_tokens = set(re.findall(r"\w+", text_value.casefold()))
             relation = len(claim_tokens & result_tokens) / max(1, len(claim_tokens))
             url = str(row.get("url", ""))
-            domain = re.sub(r"^www\.", "", url.split("/")[2] if "://" in url else "")
-            authority = .9 if domain.endswith((".gov", ".edu")) or any(name in domain for name in ("reuters", "apnews", "nature.com", "science.org", "bbc.")) else .55
+            domain = (urlsplit(url).hostname or "").casefold().removeprefix("www.")
+            authority = self._authority(domain)
             evidence.append({"id": str(uuid4()), "url": row.get("url"), "title": row.get("title"), "snippet": str(row.get("content", ""))[:1000], "domain": domain, "rank": rank, "authority": authority, "relation": "supporting" if relation >= .55 else "context"})
             if relation >= .55:
                 support_scores.append((relation + authority) / 2)
-        status = "verified" if support_scores else "unverified"
+        supporting = [item for item in evidence if item["relation"] == "supporting"]
+        independent_domains = {item["domain"] for item in supporting if item["domain"]}
+        has_primary = any(item["authority"] >= 0.8 for item in supporting)
+        status = "verified" if has_primary or len(independent_domains) >= 2 else "unverified"
         confidence = min(1.0, sum(support_scores) / len(support_scores)) if support_scores else 0.0
         return VerificationResult(verifier_type=self.verifier_type, verifier_version=self.verifier_version, status=status, confidence=confidence, evidence=evidence, details={"result_count": len(evidence), "support_count": len(support_scores)}, duration_ms=(time.perf_counter() - started) * 1000)
 
 
+@dataclass(frozen=True)
+class _BoundedProcessResult:
+    returncode: int
+    stdout: str
+    stderr: str
+    output_truncated: bool = False
+    timed_out: bool = False
+
+
 class CodeVerifier:
     verifier_type = "code"
-    verifier_version = "docker-python-v1"
+    verifier_version = "docker-python-v2"
 
-    def __init__(self, image: str, *, timeout_seconds: float = 5.0) -> None:
+    def __init__(self, image: str, *, timeout_seconds: float = 5.0, max_output_bytes: int = 4096) -> None:
         self.image = image
         self.timeout_seconds = timeout_seconds
+        self.max_output_bytes = max(256, max_output_bytes)
+
+    @staticmethod
+    def _run_bounded(
+        command: list[str],
+        script: str,
+        *,
+        timeout_seconds: float,
+        max_output_bytes: int,
+    ) -> _BoundedProcessResult:
+        """Stream a child process and kill it before output can grow unbounded."""
+
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+        )
+        assert process.stdin is not None and process.stdout is not None and process.stderr is not None
+        try:
+            try:
+                process.stdin.write(script.encode("utf-8"))
+                process.stdin.close()
+            except BrokenPipeError:
+                pass
+
+            streams = {process.stdout: bytearray(), process.stderr: bytearray()}
+            with selectors.DefaultSelector() as selector:
+                for stream in streams:
+                    selector.register(stream, selectors.EVENT_READ)
+                deadline = time.monotonic() + timeout_seconds
+                output_truncated = False
+                timed_out = False
+                while selector.get_map():
+                    remaining_time = deadline - time.monotonic()
+                    if remaining_time <= 0:
+                        timed_out = True
+                        break
+                    events = selector.select(min(0.05, remaining_time))
+                    for key, _ in events:
+                        remaining_output = max_output_bytes - sum(len(value) for value in streams.values())
+                        chunk = os.read(key.fd, min(4096, remaining_output + 1))
+                        if not chunk:
+                            selector.unregister(key.fileobj)
+                            continue
+                        destination = streams[key.fileobj]
+                        destination.extend(chunk[:remaining_output])
+                        if len(chunk) > remaining_output:
+                            output_truncated = True
+                            break
+                    if output_truncated:
+                        break
+            if output_truncated or timed_out:
+                process.kill()
+            try:
+                returncode = process.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                returncode = process.wait(timeout=1.0)
+            return _BoundedProcessResult(
+                returncode=returncode,
+                stdout=bytes(streams[process.stdout]).decode("utf-8", errors="replace"),
+                stderr=bytes(streams[process.stderr]).decode("utf-8", errors="replace"),
+                output_truncated=output_truncated,
+                timed_out=timed_out,
+            )
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=1.0)
+            for stream in (process.stdin, process.stdout, process.stderr):
+                stream.close()
+
+    @staticmethod
+    def _remove_container(container_name: str) -> None:
+        try:
+            subprocess.run(
+                ["docker", "rm", "-f", container_name],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2.0,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
 
     async def verify(self, claim: Claim, *, question: str, constraints: dict[str, Any] | str | None,
                      deadline: float | None = None) -> VerificationResult:
@@ -141,22 +259,75 @@ class CodeVerifier:
             return VerificationResult(verifier_type=self.verifier_type, verifier_version=self.verifier_version, status="unverified", details={"reason": "clearly delimited Python code and explicit tests are required"})
         script = code_match.group(1) + "\n\n" + test_blocks[-1]
 
-        def run() -> subprocess.CompletedProcess[str]:
+        container_name = f"crosscheck-{uuid4().hex}"
+
+        def run() -> _BoundedProcessResult:
             # Stream the bounded program over stdin. When the backend uses the
             # host Docker socket, host-path bind mounts would incorrectly refer
             # to the daemon host rather than this container's temporary files.
-            return subprocess.run([
-                "docker", "run", "--rm", "-i", "--network", "none", "--read-only", "--cap-drop=ALL",
-                "--security-opt=no-new-privileges", "--memory=128m", "--cpus=.5", "--pids-limit=64",
+            command = [
+                "docker", "run", "--rm", "-i", "--name", container_name,
+                "--pull=never", "--network=none", "--read-only", "--cap-drop=ALL",
+                "--security-opt=no-new-privileges", "--memory=128m", "--memory-swap=128m",
+                "--cpus=.5", "--pids-limit=64", "--ulimit=nofile=64:64",
+                f"--ulimit=cpu={max(1, int(self.timeout_seconds) + 1)}:{max(1, int(self.timeout_seconds) + 1)}",
+                "--ulimit=fsize=1024:1024", "--tmpfs=/tmp:rw,noexec,nosuid,size=16m",
                 "--user=65534:65534", self.image, "python", "-I", "-B", "-",
-            ], input=script, capture_output=True, text=True, timeout=self.timeout_seconds, check=False)
+            ]
+            return self._run_bounded(
+                command,
+                script,
+                timeout_seconds=self.timeout_seconds,
+                max_output_bytes=self.max_output_bytes,
+            )
         started = time.perf_counter()
         try:
             process = await asyncio.to_thread(run)
         except (OSError, subprocess.TimeoutExpired):
+            await asyncio.to_thread(self._remove_container, container_name)
             return VerificationResult(verifier_type=self.verifier_type, verifier_version=self.verifier_version, status="unavailable", failure_class="verifier_error", details={"reason": "sandbox unavailable"})
+        if process.timed_out or process.output_truncated:
+            await asyncio.to_thread(self._remove_container, container_name)
+            exit_class = "timeout" if process.timed_out else "output_limit"
+            return VerificationResult(
+                verifier_type=self.verifier_type,
+                verifier_version=self.verifier_version,
+                status="unverified",
+                confidence=0.0,
+                evidence=[{"id": str(uuid4()), "title": "Isolated Python test run", "relation": "context"}],
+                details={
+                    "executed": True,
+                    "passed_tests": 0,
+                    "total_tests": 0,
+                    "exit_code": process.returncode,
+                    "exit_class": exit_class,
+                    "stdout": process.stdout,
+                    "stderr": process.stderr,
+                    "output": process.stdout,
+                    "output_truncated": process.output_truncated,
+                },
+                duration_ms=(time.perf_counter() - started) * 1000,
+            )
         passed = process.returncode == 0
-        return VerificationResult(verifier_type=self.verifier_type, verifier_version=self.verifier_version, status="verified" if passed else "conflict", confidence=1.0, evidence=[{"id": str(uuid4()), "title": "Isolated Python test run", "relation": "supporting" if passed else "conflicting"}], details={"passed_tests": 1 if passed else 0, "total_tests": 1, "exit_code": process.returncode, "output": process.stdout[:2000]}, duration_ms=(time.perf_counter() - started) * 1000)
+        return VerificationResult(
+            verifier_type=self.verifier_type,
+            verifier_version=self.verifier_version,
+            status="verified" if passed else "conflict",
+            confidence=1.0,
+            evidence=[{"id": str(uuid4()), "title": "Isolated Python test run", "relation": "supporting" if passed else "conflicting"}],
+            details={
+                "executed": True,
+                "passed_tests": 1 if passed else 0,
+                "total_tests": 1,
+                "exit_code": process.returncode,
+                "exit_class": "success" if passed else "test_failure",
+                "stdout": process.stdout,
+                "stderr": process.stderr,
+                "output": process.stdout,
+                "output_truncated": False,
+            },
+            duration_ms=(time.perf_counter() - started) * 1000,
+        )
 
 
 class StaticVerifier:
