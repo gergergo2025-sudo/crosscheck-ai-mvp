@@ -82,8 +82,14 @@ fetch_base() {
     fi
   done
   printf 'regression-verification: live fetch unavailable; using carried baseline ref\n' >&2
-  local_base="$(git rev-parse --verify "origin/$AGENTOS_PULL_REQUEST_BASE" 2>/dev/null)" \
-    || local_base="$(git rev-parse --verify "refs/remotes/origin/$AGENTOS_PULL_REQUEST_BASE" 2>/dev/null)" \
+  # The workspace is a single-branch clone, so `origin/$AGENTOS_PULL_REQUEST_BASE`
+  # (the repository default, e.g. main) is usually absent. The carried ref is the
+  # remote-tracking head that provisioning fetched from the platform mirror —
+  # the exact shared head this run verified. Accept any carried origin ref as the
+  # baseline rather than failing on the missing default branch ref.
+  local_base="$(git rev-parse --verify "refs/remotes/origin/$AGENTOS_PULL_REQUEST_BASE" 2>/dev/null)" \
+    || local_base="$(git rev-parse --verify "origin/$AGENTOS_PULL_REQUEST_BASE" 2>/dev/null)" \
+    || local_base="$(git for-each-ref --format='%(objectname)' refs/remotes/origin/ 2>/dev/null | grep -E '^[0-9a-f]{40}$' | head -1)" \
     || return 1
   valid_sha "$local_base" || return 1
   printf '%s' "$local_base"
