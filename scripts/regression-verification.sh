@@ -60,23 +60,34 @@ head_sha() {
 }
 
 fetch_base() {
-  local attempt
+  local attempt fetched local_base
+  # Prefer a live fetch so the baseline is the branch's latest published head.
+  # Anneal executes this script inside an isolated session (Codex relocates
+  # HOME/credentials), so a network fetch of a private `origin` may have no
+  # credential channel. When the live fetch cannot authenticate, fall back to
+  # the remote-tracking head the workspace already carries (populated at clone
+  # / prepare time from the platform mirror), which is still a real, exact
+  # baseline for this verification — just possibly not the very newest commit.
   for attempt in 1 2 3; do
     if GIT_TERMINAL_PROMPT=0 git fetch --no-tags origin "refs/heads/$AGENTOS_PULL_REQUEST_BASE" \
       >/dev/null 2>&1; then
-      local fetched
       fetched="$(git rev-parse FETCH_HEAD)" || return 1
       valid_sha "$fetched" || return 1
       printf '%s' "$fetched"
       return 0
     fi
     if [ "$attempt" -lt 3 ]; then
-      printf 'regression-verification: target fetch failed; retrying attempt=%s/3\n' "$((attempt + 1))" >&2
+      printf 'regression-verification: live target fetch failed; retrying attempt=%s/3\n' "$((attempt + 1))" >&2
       sleep 1
     fi
   done
-  printf 'regression-verification: target fetch failed after 3 attempts\n' >&2
-  return 1
+  printf 'regression-verification: live fetch unavailable; using carried baseline ref\n' >&2
+  local_base="$(git rev-parse --verify "origin/$AGENTOS_PULL_REQUEST_BASE" 2>/dev/null)" \
+    || local_base="$(git rev-parse --verify "refs/remotes/origin/$AGENTOS_PULL_REQUEST_BASE" 2>/dev/null)" \
+    || return 1
+  valid_sha "$local_base" || return 1
+  printf '%s' "$local_base"
+  return 0
 }
 
 write_state() {
