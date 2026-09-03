@@ -22,6 +22,7 @@ class ConstraintOutcome:
     per_answer: dict[UUID, list[dict[str, Any]]] = field(default_factory=dict)
     aggregate: dict[str, Any] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
+    available: bool = True
 
 
 class ConstraintService(Protocol):
@@ -58,7 +59,72 @@ class ReportedConstraintService:
 class IndependentConstraintService:
     """Rule-based, provenance-preserving checks for explicit MVP constraints."""
 
-    version = "constraint-v3"
+    version = "constraint-v4"
+
+    _UNIT_DEFINITIONS = {
+        "ms": ("duration", "s", 0.001),
+        "millisecond": ("duration", "s", 0.001),
+        "milliseconds": ("duration", "s", 0.001),
+        "s": ("duration", "s", 1.0),
+        "sec": ("duration", "s", 1.0),
+        "secs": ("duration", "s", 1.0),
+        "second": ("duration", "s", 1.0),
+        "seconds": ("duration", "s", 1.0),
+        "min": ("duration", "s", 60.0),
+        "mins": ("duration", "s", 60.0),
+        "minute": ("duration", "s", 60.0),
+        "minutes": ("duration", "s", 60.0),
+        "h": ("duration", "s", 3600.0),
+        "hr": ("duration", "s", 3600.0),
+        "hrs": ("duration", "s", 3600.0),
+        "hour": ("duration", "s", 3600.0),
+        "hours": ("duration", "s", 3600.0),
+        "day": ("duration", "s", 86400.0),
+        "days": ("duration", "s", 86400.0),
+        "mg": ("weight", "g", 0.001),
+        "g": ("weight", "g", 1.0),
+        "gram": ("weight", "g", 1.0),
+        "grams": ("weight", "g", 1.0),
+        "kg": ("weight", "g", 1000.0),
+        "kilogram": ("weight", "g", 1000.0),
+        "kilograms": ("weight", "g", 1000.0),
+        "oz": ("weight", "g", 28.349523125),
+        "lb": ("weight", "g", 453.59237),
+        "lbs": ("weight", "g", 453.59237),
+        "mm": ("length", "mm", 1.0),
+        "cm": ("length", "mm", 10.0),
+        "m": ("length", "mm", 1000.0),
+        "in": ("length", "mm", 25.4),
+        "inch": ("length", "mm", 25.4),
+        "inches": ("length", "mm", 25.4),
+        "ft": ("length", "mm", 304.8),
+        "%": ("percentage", "%", 1.0),
+        "percent": ("percentage", "%", 1.0),
+        "percentage": ("percentage", "%", 1.0),
+    }
+
+    _DIMENSION_HINTS = {
+        "duration": "duration",
+        "max_duration": "duration",
+        "time": "duration",
+        "deadline": "duration",
+        "weight": "weight",
+        "max_weight": "weight",
+        "dimensions": "length",
+        "dimension": "length",
+        "size": "length",
+        "percentage": "percentage",
+        "max_percentage": "percentage",
+        "percent": "percentage",
+    }
+
+    _DIMENSION_ALIASES = {
+        "time": "duration",
+        "mass": "weight",
+        "dimensions": "length",
+        "dimension": "length",
+        "percent": "percentage",
+    }
 
     @staticmethod
     def _submitted(value: dict[str, Any] | str | None) -> dict[str, Any]:
@@ -120,6 +186,97 @@ class IndependentConstraintService:
         currency_text = f"{price.group('prefix') or ''} {price.group('suffix') or ''}"
         return cls._number(price.group("amount")), cls._currency(currency_text)
 
+    @classmethod
+    def _quantity(cls, value: Any, *, dimension_hint: str | None = None) -> dict[str, Any] | None:
+        raw_value = value
+        raw_unit: Any = None
+        explicit_dimension: Any = None
+        if isinstance(value, dict):
+            raw_value = value.get("value", value.get("amount"))
+            raw_unit = value.get("unit")
+            explicit_dimension = value.get("dimension")
+
+        text = str(raw_value)
+        dimension = str(explicit_dimension).casefold() if explicit_dimension else dimension_hint
+        dimension = cls._DIMENSION_ALIASES.get(dimension, dimension)
+        if dimension == "length" and isinstance(raw_value, (list, tuple)):
+            definition = cls._UNIT_DEFINITIONS.get(str(raw_unit or "").casefold())
+            numbers = [cls._number(part) for part in raw_value]
+            if not definition or definition[0] != "length" or not numbers or any(number is None for number in numbers):
+                return None
+            return {
+                "value": [number * definition[2] for number in numbers if number is not None],
+                "unit": definition[1],
+                "dimension": "length",
+            }
+        if dimension == "length" or re.search(r"\d[\d,.]*\s*[x×]\s*\d", text, re.I):
+            match = re.search(
+                r"([\d,.]+)\s*[x×]\s*([\d,.]+)(?:\s*[x×]\s*([\d,.]+))?\s*([a-zA-Z%]+)?",
+                text,
+                re.I,
+            )
+            if match:
+                unit_text = str(raw_unit or match.group(4) or "").casefold()
+                definition = cls._UNIT_DEFINITIONS.get(unit_text)
+                if not definition or definition[0] != "length":
+                    return None
+                values = [cls._number(part) for part in match.groups()[:3] if part is not None]
+                return {
+                    "value": [number * definition[2] for number in values if number is not None],
+                    "unit": definition[1],
+                    "dimension": "length",
+                }
+
+        number = cls._number(raw_value)
+        if number is None:
+            return None
+        if raw_unit is None:
+            unit_match = re.search(r"[\d,.]+\s*([a-zA-Z%]+)", text)
+            raw_unit = unit_match.group(1) if unit_match else None
+        if raw_unit is None:
+            return {"value": number, "unit": None, "dimension": dimension} if dimension else None
+        definition = cls._UNIT_DEFINITIONS.get(str(raw_unit).casefold())
+        if not definition or (dimension and definition[0] != dimension):
+            return None
+        return {"value": number * definition[2], "unit": definition[1], "dimension": definition[0]}
+
+    @classmethod
+    def _observed_quantity(cls, answer: str, *, dimension: str, name: str) -> dict[str, Any] | None:
+        if dimension == "length":
+            dimensions = re.search(
+                r"(?:dimensions?|size)\s*[:：]?\s*([\d,.]+\s*[x×]\s*[\d,.]+(?:\s*[x×]\s*[\d,.]+)?\s*[a-zA-Z]+)",
+                answer,
+                re.I,
+            )
+            if not dimensions:
+                dimensions = re.search(
+                    r"([\d,.]+\s*[x×]\s*[\d,.]+(?:\s*[x×]\s*[\d,.]+)?\s*(?:mm|cm|m|in|inch|inches|ft))",
+                    answer,
+                    re.I,
+                )
+            return cls._quantity(dimensions.group(1), dimension_hint=dimension) if dimensions else None
+
+        unit_names = [re.escape(unit) for unit, definition in cls._UNIT_DEFINITIONS.items() if definition[0] == dimension]
+        label = {
+            "duration": r"(?:duration|time|deadline)",
+            "weight": r"(?:weight)",
+            "percentage": r"(?:percentage|percent|rate)",
+        }[dimension]
+        match = re.search(
+            rf"{label}\s*[:：]?\s*([\d,.]+)\s*({'|'.join(sorted(unit_names, key=len, reverse=True))})",
+            answer,
+            re.I,
+        )
+        if not match:
+            match = re.search(
+                rf"([\d,.]+)\s*({'|'.join(sorted(unit_names, key=len, reverse=True))})",
+                answer,
+                re.I,
+            )
+        if not match:
+            return None
+        return cls._quantity(f"{match.group(1)} {match.group(2)}", dimension_hint=dimension)
+
     async def check(self, request: QueryRequest, answers: list[ModelAnswer], *, deadline: float | None = None) -> ConstraintOutcome:
         del deadline
         submitted = self._submitted(request.constraints)
@@ -150,6 +307,35 @@ class IndependentConstraintService:
                     elif expected_number is not None and observed_number is not None:
                         status = "satisfied" if observed_number <= expected_number else "violated"
                         reason = "observed value is within the maximum" if status == "satisfied" else "observed value exceeds the maximum"
+                elif name in self._DIMENSION_HINTS or self._quantity(expected) is not None:
+                    comparator = "lte"
+                    expected_quantity = self._quantity(expected, dimension_hint=self._DIMENSION_HINTS.get(name))
+                    observed_quantity = (
+                        self._observed_quantity(answer.answer, dimension=expected_quantity["dimension"], name=name)
+                        if expected_quantity is not None and expected_quantity.get("dimension")
+                        else None
+                    )
+                    expected = expected_quantity if expected_quantity is not None else expected
+                    observed = observed_quantity
+                    if expected_quantity is None:
+                        reason = "the constrained numeric value or unit is unsupported"
+                    elif observed_quantity is None:
+                        reason = "the answer did not expose a compatible numeric value and unit"
+                    else:
+                        expected_value = expected_quantity["value"]
+                        observed_value = observed_quantity["value"]
+                        if isinstance(expected_value, list) != isinstance(observed_value, list):
+                            reason = "expected and observed dimensions are not safely comparable"
+                        elif isinstance(expected_value, list):
+                            comparable = len(expected_value) == len(observed_value)
+                            if comparable:
+                                status = "satisfied" if all(left <= right for left, right in zip(observed_value, expected_value)) else "violated"
+                                reason = "observed dimensions are within the maximum" if status == "satisfied" else "an observed dimension exceeds the maximum"
+                            else:
+                                reason = "expected and observed dimensions have different shapes"
+                        else:
+                            status = "satisfied" if observed_value <= expected_value else "violated"
+                            reason = "observed value is within the maximum" if status == "satisfied" else "observed value exceeds the maximum"
                 else:
                     values = expected if isinstance(expected, list) else [expected]
                     wanted = [str(item).casefold() for item in values]

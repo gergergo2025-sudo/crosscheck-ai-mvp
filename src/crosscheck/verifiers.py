@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import ast
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import os
@@ -215,12 +216,62 @@ class _BoundedProcessResult:
 
 class CodeVerifier:
     verifier_type = "code"
-    verifier_version = "docker-python-v2"
+    verifier_version = "docker-python-v3"
 
     def __init__(self, image: str, *, timeout_seconds: float = 5.0, max_output_bytes: int = 4096) -> None:
         self.image = image
         self.timeout_seconds = timeout_seconds
         self.max_output_bytes = max(256, max_output_bytes)
+
+    @staticmethod
+    def _explicit_test_assertion_count(source: str) -> int | None:
+        """Return assertion count for a parseable explicit test block.
+
+        A fenced example is not a test contract merely because it is Python.
+        The returned count deliberately follows the public scoring unit:
+        assertion statements and common pytest/unittest assertion helpers.
+        """
+
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            return None
+
+        explicit = False
+        assertions = 0
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                modules = [alias.name for alias in node.names] if isinstance(node, ast.Import) else [node.module or ""]
+                if any(module.split(".", 1)[0] in {"pytest", "unittest"} for module in modules):
+                    explicit = True
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test_"):
+                explicit = True
+            elif isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
+                explicit = True
+            elif isinstance(node, ast.Assert):
+                explicit = True
+                assertions += 1
+            elif isinstance(node, ast.Call):
+                function_name = ""
+                if isinstance(node.func, ast.Attribute):
+                    function_name = node.func.attr
+                    if function_name == "main" and isinstance(node.func.value, ast.Name) and node.func.value.id == "unittest":
+                        explicit = True
+                elif isinstance(node.func, ast.Name):
+                    function_name = node.func.id
+                if function_name.startswith("assert"):
+                    explicit = True
+                    assertions += 1
+                elif (
+                    function_name == "raises"
+                    and isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "pytest"
+                ):
+                    explicit = True
+                    assertions += 1
+
+        return assertions if explicit else None
 
     @staticmethod
     def _run_bounded(
@@ -312,10 +363,17 @@ class CodeVerifier:
                      deadline: float | None = None) -> VerificationResult:
         del constraints, deadline
         code_match = re.search(r"```(?:python)?\s*(.*?)```", claim.claim, re.I | re.S)
-        test_blocks = re.findall(r"```(?:python)?\s*(.*?)```", question, re.I | re.S)
-        if not code_match or not test_blocks:
+        fenced_blocks = re.findall(r"```(?:python)?\s*(.*?)```", question, re.I | re.S)
+        explicit_tests: list[str] = []
+        total_tests = 0
+        for block in fenced_blocks:
+            assertion_count = self._explicit_test_assertion_count(block)
+            if assertion_count is not None:
+                explicit_tests.append(block)
+                total_tests += assertion_count
+        if not code_match or not explicit_tests or total_tests == 0:
             return VerificationResult(verifier_type=self.verifier_type, verifier_version=self.verifier_version, status="unverified", details={"reason": "clearly delimited Python code and explicit tests are required"})
-        script = code_match.group(1) + "\n\n" + test_blocks[-1]
+        script = code_match.group(1) + "\n\n" + "\n\n".join(explicit_tests)
 
         container_name = f"crosscheck-{uuid4().hex}"
 
@@ -402,8 +460,8 @@ class CodeVerifier:
             evidence=[{"id": str(uuid4()), "title": "Isolated Python test run", "relation": "supporting" if passed else "conflicting"}],
             details={
                 "executed": True,
-                "passed_tests": 1 if passed else 0,
-                "total_tests": 1,
+                "passed_tests": total_tests if passed else 0,
+                "total_tests": total_tests,
                 "exit_code": process.returncode,
                 "exit_class": "success" if passed else "test_failure",
                 "stdout": process.stdout,

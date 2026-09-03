@@ -422,6 +422,7 @@ class QueryService:
         except BaseException:
             return ConstraintOutcome(
                 warnings=["constraint verification was unavailable"],
+                available=False,
             )
         self.telemetry.emit("constraints.completed", constraint_count=len(outcome.aggregate))
         return outcome
@@ -1023,7 +1024,7 @@ class QueryService:
         if evidence_only:
             recommended_answer = None
             scoring.recommendation_message = "Evidence-only report: automated decision endorsement is suppressed for high-compliance topics."
-        status = "partial" if failures or degraded_models else "complete"
+        status = "partial" if failures or degraded_models or not constraint_outcome.available else "complete"
         warnings: list[str] = []
         for model, failure in failures:
             failure_class = _safe_failure_class(failure)

@@ -101,6 +101,40 @@ async def test_constraint_verifier_refuses_currency_mismatch() -> None:
     assert next(iter(comparable.per_answer.values()))[0]["status"] == "satisfied"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("constraint", "answer", "expected_status"),
+    [
+        ({"duration": "2 hours"}, "Duration: 90 minutes", "satisfied"),
+        ({"weight": {"value": 2, "unit": "kg"}}, "Weight: 2,100 g", "violated"),
+        ({"dimensions": "30 x 20 x 10 cm"}, "Dimensions: 29 x 19 x 9 cm", "satisfied"),
+        (
+            {"dimensions": {"value": [30, 20, 10], "unit": "cm", "dimension": "length"}},
+            "Dimensions: 31 x 19 x 9 cm",
+            "violated",
+        ),
+        ({"max_percentage": "20%"}, "Percentage: 21 percent", "violated"),
+        ({"duration": "2 hours"}, "Weight: 90 kg", "indeterminate"),
+    ],
+)
+async def test_constraint_verifier_normalizes_numeric_units_and_dimensions(
+    constraint: dict[str, object],
+    answer: str,
+    expected_status: str,
+) -> None:
+    outcome = await IndependentConstraintService().check(
+        QueryRequest(question="pick one", constraints=constraint),
+        [_answer(answer)],
+    )
+
+    check = next(iter(outcome.per_answer.values()))[0]
+    assert check["status"] == expected_status
+    assert check["comparator"] == "lte"
+    if expected_status != "indeterminate":
+        assert check["expected"]["dimension"] in {"duration", "weight", "length", "percentage"}
+        assert check["observed"]["dimension"] == check["expected"]["dimension"]
+
+
 def test_scorer_enforces_provider_and_independent_verification_caps() -> None:
     scorer = EvidenceScorer()
     answer = ModelAnswer(
@@ -222,3 +256,50 @@ async def test_code_verifier_applies_complete_docker_resource_limits(monkeypatch
     assert result.details["stdout"] == "ok"
     assert result.details["stderr"] == ""
     assert result.details["output_truncated"] is False
+
+
+@pytest.mark.asyncio
+async def test_code_verifier_counts_each_assertion_in_explicit_test_blocks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, str] = {}
+
+    def bounded(command: list[str], script: str, **kwargs: object):
+        captured["script"] = script
+        return SimpleNamespace(returncode=0, stdout="", stderr="", output_truncated=False, timed_out=False)
+
+    monkeypatch.setattr(CodeVerifier, "_run_bounded", staticmethod(bounded))
+    result = await CodeVerifier("pinned-image").verify(
+        Claim(claim="```python\ndef add(a, b): return a + b\n```", type="code", confidence=0.9),
+        question=(
+            "Example only:\n```python\nprint(add(20, 22))\n```\n"
+            "Tests:\n```python\nimport pytest\nassert add(1, 2) == 3\n"
+            "with pytest.raises(TypeError):\n    add('one', 2)\n```\n"
+            "More tests:\n```python\nclass TestAdd:\n"
+            "    def test_zero(self):\n        self.assertEqual(add(0, 0), 0)\n```"
+        ),
+        constraints=None,
+    )
+
+    assert result.status == "verified"
+    assert result.details["passed_tests"] == 3
+    assert result.details["total_tests"] == 3
+    assert "print(add(20, 22))" not in captured["script"]
+
+
+@pytest.mark.asyncio
+async def test_code_verifier_does_not_execute_non_test_fences(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        CodeVerifier,
+        "_run_bounded",
+        staticmethod(lambda *args, **kwargs: pytest.fail("non-test snippets must not execute")),
+    )
+
+    result = await CodeVerifier("pinned-image").verify(
+        Claim(claim="```python\ndef add(a, b): return a + b\n```", type="code", confidence=0.9),
+        question="Example:\n```python\nprint(add(1, 2))\n```",
+        constraints=None,
+    )
+
+    assert result.status == "unverified"
+    assert result.details["reason"] == "clearly delimited Python code and explicit tests are required"

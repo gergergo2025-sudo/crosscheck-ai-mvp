@@ -7,12 +7,13 @@ from uuid import uuid4
 import httpx
 import pytest
 
-from crosscheck.adapters import AdapterRegistry
+from crosscheck.adapters import AdapterRegistry, DeterministicAdapter
 from crosscheck.config import Settings
-from crosscheck.contracts import AdapterResult, Claim, QueryRequest, QuestionSummary, ReportResponse
+from crosscheck.contracts import AdapterResult, Claim, QueryRequest, QuestionSummary, ReportResponse, VerificationResult
+from crosscheck.main import create_app
 from crosscheck.query import QueryService
 from crosscheck.verifier_registry import default_verifier_registry
-from crosscheck.verifiers import CodeVerifier, FactVerifier
+from crosscheck.verifiers import CodeVerifier, FactVerifier, StaticVerifier, VerifierRegistry
 
 
 @pytest.mark.asyncio
@@ -89,6 +90,34 @@ async def test_missing_docker_image_is_sanitized_unavailable(monkeypatch: pytest
     assert result.failure_class == "sandbox_unavailable"
     assert result.details == {"reason": "sandbox image or Docker service unavailable"}
     assert daemon_error not in str(result.model_dump())
+
+
+@pytest.mark.asyncio
+async def test_constraint_service_failure_makes_report_partial(tmp_path) -> None:
+    class FailingConstraints:
+        version = "failing-test"
+
+        async def check(self, request, answers, *, deadline=None):
+            raise RuntimeError("constraint backend failed")
+
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'constraints.db'}",
+        redis_url="",
+        crosscheck_models="deterministic",
+    )
+    app = create_app(
+        settings=settings,
+        adapters=AdapterRegistry({"deterministic": DeterministicAdapter()}),
+        verifiers=VerifierRegistry({"*": StaticVerifier(VerificationResult(status="verified", confidence=1.0))}),
+        constraint_service=FailingConstraints(),
+    )
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post("/api/query", json={"question": "Pick one", "constraints": {"weight": "2 kg"}})
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "partial"
+    assert "constraint verification was unavailable" in response.json()["warnings"]
 
 
 @pytest.mark.asyncio
