@@ -245,7 +245,15 @@ async def test_fact_and_code_verifiers_have_bounded_negative_and_positive_paths(
     monkeypatch.setattr(
         CodeVerifier,
         "_run_bounded",
-        staticmethod(lambda command, script, **kwargs: SimpleNamespace(returncode=0, stdout="ok", stderr="", output_truncated=False, timed_out=False)),
+        staticmethod(
+            lambda command, script, **kwargs: SimpleNamespace(
+                returncode=0,
+                stdout=f"ok\n{CodeVerifier._PYTEST_RESULT_PREFIX}{{\"passed\": 1, \"total\": 1}}\n",
+                stderr="",
+                output_truncated=False,
+                timed_out=False,
+            )
+        ),
     )
     code = Claim(claim="```python\ndef add(a,b): return a+b\n```", type="code", confidence=.8)
     code_result = await CodeVerifier("pinned-image").verify(code, question="Tests:\n```python\nassert add(1,2)==3\n```", constraints=None)

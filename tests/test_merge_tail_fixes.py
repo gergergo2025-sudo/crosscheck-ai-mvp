@@ -18,6 +18,10 @@ def _answer(text: str) -> ModelAnswer:
     return ModelAnswer(id=uuid4(), model="m", provider="p", answer=text)
 
 
+def _pytest_output(passed: int, total: int, output: str = "") -> str:
+    return f"{output}\n{CodeVerifier._PYTEST_RESULT_PREFIX}{{\"passed\": {passed}, \"total\": {total}}}\n"
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("url", "expected_authority"),
@@ -226,7 +230,7 @@ async def test_code_verifier_applies_complete_docker_resource_limits(monkeypatch
 
     def bounded(command: list[str], script: str, *, timeout_seconds: float, max_output_bytes: int):
         captured.update(command=command, script=script, timeout=timeout_seconds, output_limit=max_output_bytes)
-        return SimpleNamespace(returncode=0, stdout="ok", stderr="", output_truncated=False, timed_out=False)
+        return SimpleNamespace(returncode=0, stdout=_pytest_output(1, 1, "ok"), stderr="", output_truncated=False, timed_out=False)
 
     monkeypatch.setattr(CodeVerifier, "_run_bounded", staticmethod(bounded))
     verifier = CodeVerifier("crosscheck-python-sandbox:3.11.9")
@@ -249,9 +253,12 @@ async def test_code_verifier_applies_complete_docker_resource_limits(monkeypatch
         "--pids-limit=64",
         "--tmpfs=/tmp:rw,noexec,nosuid,size=16m",
         "--ulimit=nofile=64:64",
+        "--ulimit=fsize=65536:65536",
         "--pull=never",
     ):
         assert required in command
+    assert command[-2] == "-c"
+    assert "pytest.main" in command[-1]
     assert result.status == "verified"
     assert result.details["stdout"] == "ok"
     assert result.details["stderr"] == ""
@@ -259,14 +266,14 @@ async def test_code_verifier_applies_complete_docker_resource_limits(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_code_verifier_counts_each_assertion_in_explicit_test_blocks(
+async def test_code_verifier_uses_runner_counts_for_explicit_test_blocks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: dict[str, str] = {}
 
     def bounded(command: list[str], script: str, **kwargs: object):
         captured["script"] = script
-        return SimpleNamespace(returncode=0, stdout="", stderr="", output_truncated=False, timed_out=False)
+        return SimpleNamespace(returncode=0, stdout=_pytest_output(3, 3), stderr="", output_truncated=False, timed_out=False)
 
     monkeypatch.setattr(CodeVerifier, "_run_bounded", staticmethod(bounded))
     result = await CodeVerifier("pinned-image").verify(
@@ -275,7 +282,7 @@ async def test_code_verifier_counts_each_assertion_in_explicit_test_blocks(
             "Example only:\n```python\nprint(add(20, 22))\n```\n"
             "Tests:\n```python\nimport pytest\nassert add(1, 2) == 3\n"
             "with pytest.raises(TypeError):\n    add('one', 2)\n```\n"
-            "More tests:\n```python\nclass TestAdd:\n"
+            "More tests:\n```python\nimport unittest\nclass TestAdd(unittest.TestCase):\n"
             "    def test_zero(self):\n        self.assertEqual(add(0, 0), 0)\n```"
         ),
         constraints=None,
@@ -285,6 +292,71 @@ async def test_code_verifier_counts_each_assertion_in_explicit_test_blocks(
     assert result.details["passed_tests"] == 3
     assert result.details["total_tests"] == 3
     assert "print(add(20, 22))" not in captured["script"]
+
+
+@pytest.mark.asyncio
+async def test_code_verifier_counts_pytest_functions_and_unittest_methods_that_execute(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_bounded = CodeVerifier._run_bounded
+
+    def run_with_host_pytest(command: list[str], script: str, **kwargs: object):
+        del command
+        return run_bounded(
+            [sys.executable, "-I", "-B", "-c", CodeVerifier._PYTEST_RUNNER],
+            script,
+            timeout_seconds=float(kwargs["timeout_seconds"]),
+            max_output_bytes=int(kwargs["max_output_bytes"]),
+        )
+
+    monkeypatch.setattr(CodeVerifier, "_run_bounded", staticmethod(run_with_host_pytest))
+    result = await CodeVerifier("pinned-image").verify(
+        Claim(claim="```python\ndef add(a, b): return a + b\n```", type="code", confidence=0.9),
+        question=(
+            "```python\nimport unittest\n"
+            "def test_positive():\n    assert add(1, 2) == 3\n"
+            "def test_zero():\n    assert add(0, 0) == 0\n    assert add(0, 4) == 4\n"
+            "class TestAdd(unittest.TestCase):\n"
+            "    def test_negative(self):\n        self.assertEqual(add(-1, -2), -3)\n```"
+        ),
+        constraints=None,
+    )
+
+    assert result.status == "verified"
+    assert result.details["passed_tests"] == 3
+    assert result.details["total_tests"] == 3
+    assert "CROSSCHECK_PYTEST_RESULT=" not in result.details["stdout"]
+
+
+@pytest.mark.asyncio
+async def test_code_verifier_reports_partial_real_runner_counts_on_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_bounded = CodeVerifier._run_bounded
+
+    def run_with_host_pytest(command: list[str], script: str, **kwargs: object):
+        del command
+        return run_bounded(
+            [sys.executable, "-I", "-B", "-c", CodeVerifier._PYTEST_RUNNER],
+            script,
+            timeout_seconds=float(kwargs["timeout_seconds"]),
+            max_output_bytes=int(kwargs["max_output_bytes"]),
+        )
+
+    monkeypatch.setattr(CodeVerifier, "_run_bounded", staticmethod(run_with_host_pytest))
+    result = await CodeVerifier("pinned-image").verify(
+        Claim(claim="```python\ndef identity(value): return value\n```", type="code", confidence=0.9),
+        question=(
+            "```python\n"
+            "def test_passes():\n    assert identity(1) == 1\n"
+            "def test_fails():\n    assert identity(1) == 2\n```"
+        ),
+        constraints=None,
+    )
+
+    assert result.status == "conflict"
+    assert result.details["passed_tests"] == 1
+    assert result.details["total_tests"] == 2
 
 
 @pytest.mark.asyncio

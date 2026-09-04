@@ -6,6 +6,7 @@ import asyncio
 import ast
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import json
 import os
 import re
 import selectors
@@ -216,7 +217,49 @@ class _BoundedProcessResult:
 
 class CodeVerifier:
     verifier_type = "code"
-    verifier_version = "docker-python-v3"
+    verifier_version = "docker-python-v4"
+    _PYTEST_RESULT_PREFIX = "CROSSCHECK_PYTEST_RESULT="
+    _PYTEST_RUNNER = r'''
+import json
+import os
+import sys
+
+os.environ["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
+import pytest
+
+
+class CrossCheckResults:
+    def __init__(self):
+        self.total = 0
+        self.outcomes = {}
+
+    def pytest_collection_finish(self, session):
+        self.total = len(session.items)
+
+    def pytest_runtest_logreport(self, report):
+        if report.failed or report.skipped:
+            self.outcomes[report.nodeid] = False
+        elif report.when == "call" and report.passed:
+            self.outcomes.setdefault(report.nodeid, True)
+
+    @property
+    def passed(self):
+        return sum(outcome is True for outcome in self.outcomes.values())
+
+
+sources = json.loads(sys.stdin.read())
+paths = []
+for index, source in enumerate(sources):
+    path = f"/tmp/test_crosscheck_{index}.py"
+    with open(path, "w", encoding="utf-8") as test_file:
+        test_file.write(source)
+    paths.append(path)
+
+results = CrossCheckResults()
+exit_code = pytest.main(["-q", "--disable-warnings", "--tb=short", *paths], plugins=[results])
+print("\nCROSSCHECK_PYTEST_RESULT=" + json.dumps({"passed": results.passed, "total": results.total}), flush=True)
+raise SystemExit(int(exit_code))
+'''
 
     def __init__(self, image: str, *, timeout_seconds: float = 5.0, max_output_bytes: int = 4096) -> None:
         self.image = image
@@ -224,21 +267,15 @@ class CodeVerifier:
         self.max_output_bytes = max(256, max_output_bytes)
 
     @staticmethod
-    def _explicit_test_assertion_count(source: str) -> int | None:
-        """Return assertion count for a parseable explicit test block.
-
-        A fenced example is not a test contract merely because it is Python.
-        The returned count deliberately follows the public scoring unit:
-        assertion statements and common pytest/unittest assertion helpers.
-        """
+    def _is_explicit_test(source: str) -> bool:
+        """Return whether a parseable fence declares an explicit test contract."""
 
         try:
             tree = ast.parse(source)
         except SyntaxError:
-            return None
+            return False
 
         explicit = False
-        assertions = 0
         for node in ast.walk(tree):
             if isinstance(node, (ast.Import, ast.ImportFrom)):
                 modules = [alias.name for alias in node.names] if isinstance(node, ast.Import) else [node.module or ""]
@@ -250,7 +287,6 @@ class CodeVerifier:
                 explicit = True
             elif isinstance(node, ast.Assert):
                 explicit = True
-                assertions += 1
             elif isinstance(node, ast.Call):
                 function_name = ""
                 if isinstance(node.func, ast.Attribute):
@@ -261,7 +297,6 @@ class CodeVerifier:
                     function_name = node.func.id
                 if function_name.startswith("assert"):
                     explicit = True
-                    assertions += 1
                 elif (
                     function_name == "raises"
                     and isinstance(node.func, ast.Attribute)
@@ -269,9 +304,89 @@ class CodeVerifier:
                     and node.func.value.id == "pytest"
                 ):
                     explicit = True
-                    assertions += 1
 
-        return assertions if explicit else None
+        return explicit
+
+    @staticmethod
+    def _is_inline_test_statement(node: ast.stmt) -> bool:
+        """Identify direct assertions that pytest would otherwise run only at collection."""
+
+        if isinstance(node, ast.Assert):
+            return True
+        calls: list[ast.Call] = []
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+            calls.append(node.value)
+        elif isinstance(node, (ast.With, ast.AsyncWith)):
+            calls.extend(
+                item.context_expr
+                for item in node.items
+                if isinstance(item.context_expr, ast.Call)
+            )
+        for call in calls:
+            if isinstance(call.func, ast.Attribute):
+                if call.func.attr.startswith("assert"):
+                    return True
+                if (
+                    call.func.attr == "raises"
+                    and isinstance(call.func.value, ast.Name)
+                    and call.func.value.id == "pytest"
+                ):
+                    return True
+            elif isinstance(call.func, ast.Name) and call.func.id.startswith("assert"):
+                return True
+        return False
+
+    @classmethod
+    def _prepare_test_block(cls, source: str, block_index: int) -> str:
+        """Make direct assertion fences collectable while preserving declared tests."""
+
+        tree = ast.parse(source)
+        transformed: list[ast.stmt] = []
+        inline_index = 0
+        for node in tree.body:
+            if cls._is_inline_test_statement(node):
+                transformed.append(
+                    ast.FunctionDef(
+                        name=f"test_crosscheck_inline_{block_index}_{inline_index}",
+                        args=ast.arguments(
+                            posonlyargs=[],
+                            args=[],
+                            kwonlyargs=[],
+                            kw_defaults=[],
+                            defaults=[],
+                        ),
+                        body=[node],
+                        decorator_list=[],
+                    )
+                )
+                inline_index += 1
+            else:
+                transformed.append(node)
+        if inline_index == 0:
+            return source
+        tree.body = transformed
+        ast.fix_missing_locations(tree)
+        return ast.unparse(tree) + "\n"
+
+    @classmethod
+    def _pytest_counts(cls, stdout: str) -> tuple[int, int, str] | None:
+        """Parse and remove the trusted runner's final machine-readable summary."""
+
+        pattern = re.compile(rf"(?m)^{re.escape(cls._PYTEST_RESULT_PREFIX)}([^\r\n]+)\r?$")
+        matches = list(pattern.finditer(stdout))
+        if not matches:
+            return None
+        match = matches[-1]
+        try:
+            payload = json.loads(match.group(1))
+            passed_tests = int(payload["passed"])
+            total_tests = int(payload["total"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if passed_tests < 0 or total_tests < 0 or passed_tests > total_tests:
+            return None
+        visible_stdout = (stdout[: match.start()] + stdout[match.end() :]).rstrip("\r\n")
+        return passed_tests, total_tests, visible_stdout
 
     @staticmethod
     def _run_bounded(
@@ -365,15 +480,13 @@ class CodeVerifier:
         code_match = re.search(r"```(?:python)?\s*(.*?)```", claim.claim, re.I | re.S)
         fenced_blocks = re.findall(r"```(?:python)?\s*(.*?)```", question, re.I | re.S)
         explicit_tests: list[str] = []
-        total_tests = 0
-        for block in fenced_blocks:
-            assertion_count = self._explicit_test_assertion_count(block)
-            if assertion_count is not None:
-                explicit_tests.append(block)
-                total_tests += assertion_count
-        if not code_match or not explicit_tests or total_tests == 0:
+        for block_index, block in enumerate(fenced_blocks):
+            if self._is_explicit_test(block):
+                explicit_tests.append(self._prepare_test_block(block, block_index))
+        if not code_match or not explicit_tests:
             return VerificationResult(verifier_type=self.verifier_type, verifier_version=self.verifier_version, status="unverified", details={"reason": "clearly delimited Python code and explicit tests are required"})
-        script = code_match.group(1) + "\n\n" + "\n\n".join(explicit_tests)
+        programs = [code_match.group(1) + "\n\n" + test for test in explicit_tests]
+        script = json.dumps(programs)
 
         container_name = f"crosscheck-{uuid4().hex}"
 
@@ -387,8 +500,8 @@ class CodeVerifier:
                 "--security-opt=no-new-privileges", "--memory=128m", "--memory-swap=128m",
                 "--cpus=.5", "--pids-limit=64", "--ulimit=nofile=64:64",
                 f"--ulimit=cpu={max(1, int(self.timeout_seconds) + 1)}:{max(1, int(self.timeout_seconds) + 1)}",
-                "--ulimit=fsize=1024:1024", "--tmpfs=/tmp:rw,noexec,nosuid,size=16m",
-                "--user=65534:65534", self.image, "python", "-I", "-B", "-",
+                "--ulimit=fsize=65536:65536", "--tmpfs=/tmp:rw,noexec,nosuid,size=16m",
+                "--user=65534:65534", self.image, "python", "-I", "-B", "-c", self._PYTEST_RUNNER,
             ]
             return self._run_bounded(
                 command,
@@ -451,22 +564,35 @@ class CodeVerifier:
                 details={"reason": "sandbox image or Docker service unavailable"},
                 duration_ms=(time.perf_counter() - started) * 1000,
             )
-        passed = process.returncode == 0
+        runner_result = self._pytest_counts(process.stdout)
+        if runner_result is None:
+            return VerificationResult(
+                verifier_type=self.verifier_type,
+                verifier_version=self.verifier_version,
+                status="unavailable",
+                confidence=0.0,
+                failure_class="verifier_error",
+                details={"reason": "sandbox test runner did not report results"},
+                duration_ms=(time.perf_counter() - started) * 1000,
+            )
+        passed_tests, total_tests, visible_stdout = runner_result
+        passed = process.returncode == 0 and total_tests > 0 and passed_tests == total_tests
+        no_tests = total_tests == 0 and process.returncode == 5
         return VerificationResult(
             verifier_type=self.verifier_type,
             verifier_version=self.verifier_version,
-            status="verified" if passed else "conflict",
-            confidence=1.0,
-            evidence=[{"id": str(uuid4()), "title": "Isolated Python test run", "relation": "supporting" if passed else "conflicting"}],
+            status="verified" if passed else "unverified" if no_tests else "conflict",
+            confidence=0.0 if no_tests else 1.0,
+            evidence=[{"id": str(uuid4()), "title": "Isolated Python test run", "relation": "supporting" if passed else "context" if no_tests else "conflicting"}],
             details={
                 "executed": True,
-                "passed_tests": total_tests if passed else 0,
+                "passed_tests": passed_tests,
                 "total_tests": total_tests,
                 "exit_code": process.returncode,
-                "exit_class": "success" if passed else "test_failure",
-                "stdout": process.stdout,
+                "exit_class": "success" if passed else "no_tests" if no_tests else "test_failure",
+                "stdout": visible_stdout,
                 "stderr": process.stderr,
-                "output": process.stdout,
+                "output": visible_stdout,
                 "output_truncated": False,
             },
             duration_ms=(time.perf_counter() - started) * 1000,
